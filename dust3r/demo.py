@@ -191,26 +191,26 @@ def set_scenegraph_options(inputfiles, winsize, refid, scenegraph_type):
     max_winsize = max(1, math.ceil((num_files - 1) / 2))
     if scenegraph_type == "swin":
         winsize = gradio.Slider(label="Scene Graph: Window Size", value=max_winsize,
-                                minimum=1, maximum=max_winsize, step=1, visible=True)
+                                minimum=1, maximum=max(2, max_winsize), step=1, visible=True)
         refid = gradio.Slider(label="Scene Graph: Id", value=0, minimum=0,
-                              maximum=num_files - 1, step=1, visible=False)
+                              maximum=max(1, num_files - 1), step=1, visible=False)
     elif scenegraph_type == "oneref":
         winsize = gradio.Slider(label="Scene Graph: Window Size", value=max_winsize,
-                                minimum=1, maximum=max_winsize, step=1, visible=False)
+                                minimum=1, maximum=max(2, max_winsize), step=1, visible=False)
         refid = gradio.Slider(label="Scene Graph: Id", value=0, minimum=0,
-                              maximum=num_files - 1, step=1, visible=True)
+                              maximum=max(1, num_files - 1), step=1, visible=True)
     else:
         winsize = gradio.Slider(label="Scene Graph: Window Size", value=max_winsize,
-                                minimum=1, maximum=max_winsize, step=1, visible=False)
+                                minimum=1, maximum=max(2, max_winsize), step=1, visible=False)
         refid = gradio.Slider(label="Scene Graph: Id", value=0, minimum=0,
-                              maximum=num_files - 1, step=1, visible=False)
+                              maximum=max(1, num_files - 1), step=1, visible=False)
     return winsize, refid
 
 
 def main_demo(tmpdirname, model, device, image_size, server_name, server_port, silent=False):
     recon_fun = functools.partial(get_reconstructed_scene, tmpdirname, model, device, silent, image_size)
     model_from_scene_fun = functools.partial(get_3D_model_from_scene, tmpdirname, silent)
-    with gradio.Blocks(css=""".gradio-container {margin: 0 !important; min-width: 100%};""", title="DUSt3R Demo") as demo:
+    with gradio.Blocks(title="DUSt3R Demo") as demo:
         # scene state is save so that you can change conf_thr, cam_size... without rerunning the inference
         scene = gradio.State(None)
         gradio.HTML('<h2 style="text-align: center;">DUSt3R Demo</h2>')
@@ -228,8 +228,8 @@ def main_demo(tmpdirname, model, device, image_size, server_name, server_port, s
                                                   info="Define how to make pairs",
                                                   interactive=True)
                 winsize = gradio.Slider(label="Scene Graph: Window Size", value=1,
-                                        minimum=1, maximum=1, step=1, visible=False)
-                refid = gradio.Slider(label="Scene Graph: Id", value=0, minimum=0, maximum=0, step=1, visible=False)
+                                        minimum=1, maximum=2, step=1, visible=False)
+                refid = gradio.Slider(label="Scene Graph: Id", value=0, minimum=0, maximum=1, step=1, visible=False)
 
             run_btn = gradio.Button("Run")
 
@@ -284,4 +284,5 @@ def main_demo(tmpdirname, model, device, image_size, server_name, server_port, s
                                     inputs=[scene, min_conf_thr, as_pointcloud, mask_sky,
                                             clean_depth, transparent_cams, cam_size],
                                     outputs=outmodel)
-    demo.launch(share=False, server_name=server_name, server_port=server_port)
+    demo.launch(share=False, server_name=server_name, server_port=server_port,
+               css=".gradio-container {margin: 0 !important; min-width: 100%}")
