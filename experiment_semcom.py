@@ -35,7 +35,7 @@ import torch
 # ── Path setup ────────────────────────────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(__file__))
 
-from dust3r.model_semcom import load_semcom_model
+from dust3r.model_semcom import load_semcom_model, load_semcom_model_phaseB
 from dust3r.inference import inference
 from dust3r.image_pairs import make_pairs
 from dust3r.utils.image import load_images
@@ -161,9 +161,14 @@ def run_experiment(args):
         snr_label = 'inf' if snr_db == float('inf') else f'{snr_db:.1f}'
         print(f'  SNR = {snr_label:>6} dB  |  loading model ...', end=' ', flush=True)
 
-        model = load_semcom_model(
-            args.weights, device,
-            snr_db=snr_db, channel=args.channel, verbose=False)
+        if args.jscc_weights:
+            model = load_semcom_model_phaseB(
+                args.weights, args.jscc_weights, device,
+                snr_db=snr_db, verbose=False)
+        else:
+            model = load_semcom_model(
+                args.weights, device,
+                snr_db=snr_db, channel=args.channel, verbose=False)
 
         with torch.no_grad():
             output = inference(pairs, model, device, batch_size=1, verbose=False)
@@ -195,8 +200,9 @@ def run_experiment(args):
         torch.cuda.empty_cache()
 
     # ── Summary table ─────────────────────────────────────────────────────────
+    phase_label = 'Phase B' if args.jscc_weights else 'Phase A'
     print('\n' + '=' * 60)
-    print(f'  SUMMARY  ({args.channel.upper()} channel)')
+    print(f'  SUMMARY  ({args.channel.upper()} channel, {phase_label})')
     print('=' * 60)
     header = f'  {"SNR (dB)":>10}  {"mean_conf":>10}  {"pts3d_MSE":>12}  {"GA_loss":>12}'
     print(header)
@@ -221,6 +227,8 @@ def run_experiment(args):
         import json
         out_data = {
             'channel': args.channel,
+            'phase': 'B' if args.jscc_weights else 'A',
+            'jscc_weights': args.jscc_weights,
             'images': image_paths,
             'baseline': {'mean_conf': conf_clean, 'ga_loss': ga_loss_clean},
             'sweep': results,
@@ -255,6 +263,11 @@ def get_args():
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--output', default=None,
                         help='Save results to this JSON file')
+    parser.add_argument('--jscc_weights', default=None,
+                        help='(Phase B) Path to JSCC checkpoint produced by '
+                             'train_semcom_phaseB.py.  When provided, the JSCC '
+                             'encoder/decoder is loaded from this file instead '
+                             'of using the Phase A identity mapping.')
     return parser.parse_args()
 
 

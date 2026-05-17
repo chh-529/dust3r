@@ -8,7 +8,7 @@
 import torch
 
 from dust3r.model import AsymmetricCroCo3DStereo, load_model
-from dust3r.semcom import PhaseASemCom
+from dust3r.semcom import PhaseASemCom, PhaseBSemCom
 
 
 class AsymmetricCroCo3DStereo_SemCom(AsymmetricCroCo3DStereo):
@@ -110,3 +110,74 @@ def load_semcom_model(model_path: str, device: str,
 
     model = model.to(device).eval()
     return model
+
+
+def load_semcom_model_phaseB(
+    dust3r_path: str,
+    jscc_path: str,
+    device: str,
+    snr_db: float = 10.0,
+    verbose: bool = True,
+):
+    """
+    Load a pretrained DUSt3R checkpoint together with a Phase B JSCC checkpoint
+    (saved by ``train_semcom_phaseB.py``).
+
+    Args:
+        dust3r_path : Path to the original DUSt3R .pth checkpoint.
+        jscc_path   : Path to the JSCC checkpoint produced by training.
+        device      : ``'cuda'`` or ``'cpu'``.
+        snr_db      : Inference-time SNR in dB.  May differ from the SNR used
+                      during training (useful for evaluating generalisation).
+        verbose     : Print loading messages.
+
+    Returns:
+        model : AsymmetricCroCo3DStereo_SemCom with Phase B JSCC, in eval mode.
+
+    Checkpoint format (written by train_semcom_phaseB.py):
+        {
+            'jscc_state_dict' : PhaseBSemCom state dict,
+            'config'          : {'feat_dim', 'channel_dim', 'channel',
+                                 'snr_db' (training SNR or range)},
+            'epoch'           : last completed epoch (int),
+            'train_losses'    : list of per-epoch mean losses,
+        }
+    """
+    import torch
+
+    # 1. Load DUSt3R backbone (frozen weights)
+    base = load_model(dust3r_path, device='cpu', verbose=verbose)
+
+    # 2. Load JSCC checkpoint
+    jscc_ckpt = torch.load(jscc_path, map_location='cpu', weights_only=False)
+    cfg = jscc_ckpt['config']
+
+    if verbose:
+        ratio = cfg['channel_dim'] / cfg['feat_dim']
+        trained_snr = cfg.get('snr_db', cfg.get('snr_range', 'N/A'))
+        hidden_dim = cfg.get('hidden_dim', cfg['feat_dim'])
+        print(
+            f'[SemCom Phase B] Loaded JSCC from {jscc_path}\n'
+            f'  feat_dim={cfg["feat_dim"]}, hidden_dim={hidden_dim}, '
+            f'channel_dim={cfg["channel_dim"]} '
+            f'(ratio={ratio:.3f}), channel={cfg["channel"]}\n'
+            f'  Trained at SNR={trained_snr} dB  |  Inference SNR={snr_db} dB'
+        )
+
+    # 3. Rebuild PhaseBSemCom and load weights
+    semcom = PhaseBSemCom(
+        feat_dim=cfg['feat_dim'],
+        channel_dim=cfg['channel_dim'],
+        hidden_dim=cfg.get('hidden_dim', None),   # None → defaults to feat_dim
+        snr_db=snr_db,          # inference SNR (may differ from training SNR)
+        channel=cfg['channel'],
+    )
+    semcom.load_state_dict(jscc_ckpt['jscc_state_dict'])
+
+    # 4. Transplant into the SemCom-aware model class
+    model = AsymmetricCroCo3DStereo_SemCom.__new__(AsymmetricCroCo3DStereo_SemCom)
+    model.__dict__.update(base.__dict__)
+    model.semcom = semcom
+    model.__class__ = AsymmetricCroCo3DStereo_SemCom
+
+    return model.to(device).eval()

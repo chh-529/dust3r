@@ -53,7 +53,34 @@ def parse_sweep(result: dict):
 def label_for(result: dict, path: str) -> str:
     """Auto-generate a legend label from the result metadata."""
     channel = result.get('channel', 'awgn').upper()
-    return f"{channel} ({os.path.splitext(os.path.basename(path))[0]})"
+    phase   = result.get('phase', 'A')
+    stem    = os.path.splitext(os.path.basename(path))[0]
+    # Remove redundant phase tag from filename stem (desktop_phaseB_awgn → desktop_awgn)
+    stem_clean = stem.replace('_phaseB', '').replace('_phaseA', '')
+    return f"Phase {phase} {channel} ({stem_clean})"
+
+
+def _detect_phases(results_list: list) -> set:
+    """Return the set of phase labels ('A', 'B') found in results."""
+    return {r.get('phase', 'A') for r in results_list}
+
+
+def _make_title(phases: set) -> str:
+    if phases == {'A'}:
+        return 'DUSt3R + SemCom — Phase A: SNR Sweep Results'
+    elif phases == {'B'}:
+        return 'DUSt3R + SemCom — Phase B: SNR Sweep Results'
+    else:
+        return 'DUSt3R + SemCom — Phase A vs B Comparison: SNR Sweep'
+
+
+def _make_filename(phases: set) -> str:
+    if phases == {'A'}:
+        return 'semcom_phaseA_results.png'
+    elif phases == {'B'}:
+        return 'semcom_phaseB_results.png'
+    else:
+        return 'semcom_phaseAB_comparison.png'
 
 
 # ── Plot helpers ──────────────────────────────────────────────────────────────
@@ -168,10 +195,10 @@ def plot_ga_loss(ax, results_list, paths, placeholder=25.0):
 
 def make_plots(result_paths: list, outdir: str | None = None):
     results_list = [load_result(p) for p in result_paths]
+    phases = _detect_phases(results_list)
 
     fig, axes = plt.subplots(2, 2, figsize=(13, 9))
-    fig.suptitle('DUSt3R + SemCom — Phase A: SNR Sweep Results',
-                 fontsize=15, fontweight='bold', y=1.01)
+    fig.suptitle(_make_title(phases), fontsize=15, fontweight='bold', y=1.01)
 
     plot_mean_conf(axes[0, 0], results_list, result_paths)
     plot_conf_drop(axes[0, 1], results_list, result_paths)
@@ -182,7 +209,7 @@ def make_plots(result_paths: list, outdir: str | None = None):
 
     if outdir:
         os.makedirs(outdir, exist_ok=True)
-        out_path = os.path.join(outdir, 'semcom_phaseA_results.png')
+        out_path = os.path.join(outdir, _make_filename(phases))
         plt.savefig(out_path, dpi=150, bbox_inches='tight')
         print(f'[Saved] {out_path}')
         # Also save individual plots
