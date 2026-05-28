@@ -45,7 +45,7 @@ from dust3r.image_pairs import make_pairs
 from dust3r.utils.image import load_images, rgb
 from dust3r.utils.device import to_numpy
 from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
-from dust3r.model_semcom import load_semcom_model, load_semcom_model_phaseB
+from dust3r.model_semcom import load_semcom_model, load_semcom_model_phaseB, load_semcom_model_phaseC
 
 pl.ion()
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -53,26 +53,28 @@ torch.backends.cuda.matmul.allow_tf32 = True
 
 # ── Model loader ──────────────────────────────────────────────────────────────
 
-def build_model(weights: str, jscc_weights: str | None, device: str,
-                channel: str, snr_db: float):
+def build_model(weights: str, jscc_weights: str | None, phase: str,
+                device: str, channel: str, snr_db: float):
     """
     Build the appropriate model variant based on UI settings.
 
     channel == 'none'  → clean DUSt3R (no SemCom)
     channel != 'none'  → SemCom wrapper
-      jscc_weights provided → Phase B (trained Linear JSCC)
-      jscc_weights is None  → Phase A (identity JSCC)
+      phase == 'C' + jscc_weights → Phase C (fine-tuned backbone + JSCC)
+      phase == 'B' + jscc_weights → Phase B (trained JSCC only)
+      jscc_weights is None        → Phase A (identity JSCC)
     """
     if channel == 'none':
-        # Clean baseline: load Phase A with SNR=inf (identity path)
         return load_semcom_model(weights, device, snr_db=float('inf'), verbose=False)
 
     if jscc_weights is not None:
-        # Phase B: load trained JSCC encoder/decoder
-        return load_semcom_model_phaseB(
-            weights, jscc_weights, device, snr_db=snr_db, verbose=False)
+        if phase == 'C':
+            return load_semcom_model_phaseC(
+                weights, jscc_weights, device, snr_db=snr_db, verbose=False)
+        else:
+            return load_semcom_model_phaseB(
+                weights, jscc_weights, device, snr_db=snr_db, verbose=False)
     else:
-        # Phase A: identity JSCC, direct noise injection
         return load_semcom_model(
             weights, device, snr_db=snr_db, channel=channel, verbose=False)
 
@@ -80,7 +82,7 @@ def build_model(weights: str, jscc_weights: str | None, device: str,
 # ── Reconstruction function ───────────────────────────────────────────────────
 
 def get_reconstructed_scene(
-    outdir, weights, jscc_weights, device, image_size, silent,
+    outdir, weights, jscc_weights, phase, device, image_size, silent,
     filelist, channel, snr_db,
     schedule, niter, min_conf_thr,
     as_pointcloud, mask_sky, clean_depth, transparent_cams, cam_size,
@@ -90,7 +92,7 @@ def get_reconstructed_scene(
         return None, None, None
 
     # Build model with current channel / SNR settings
-    model = build_model(weights, jscc_weights, device, channel, float(snr_db))
+    model = build_model(weights, jscc_weights, phase, device, channel, float(snr_db))
 
     imgs = load_images(filelist, size=image_size, verbose=not silent)
     if len(imgs) == 1:
@@ -146,16 +148,21 @@ def get_reconstructed_scene(
 
 # ── Gradio UI ─────────────────────────────────────────────────────────────────
 
-def main_demo(tmpdirname, weights, jscc_weights, device, image_size, server_name,
+def main_demo(tmpdirname, weights, jscc_weights, phase, device, image_size, server_name,
               server_port, silent=False):
     recon_fn = functools.partial(
         get_reconstructed_scene,
-        tmpdirname, weights, jscc_weights, device, image_size, silent,
+        tmpdirname, weights, jscc_weights, phase, device, image_size, silent,
     )
 
     model_from_scene_fn = functools.partial(get_3D_model_from_scene, tmpdirname, silent)
 
-    phase_label = 'Phase B (trained JSCC)' if jscc_weights else 'Phase A (identity JSCC)'
+    if not jscc_weights:
+        phase_label = 'Phase A (identity JSCC)'
+    elif phase == 'C':
+        phase_label = 'Phase C (fine-tuned backbone + JSCC)'
+    else:
+        phase_label = 'Phase B (trained JSCC)'
 
     with gradio.Blocks(title='DUSt3R × SemCom Demo') as demo:
         scene_state = gradio.State(None)
@@ -276,8 +283,9 @@ def get_args():
     p.add_argument('--weights', required=True,
                    help='DUSt3R checkpoint path.')
     p.add_argument('--jscc_weights', default=None,
-                   help='(Phase B) Trained JSCC checkpoint from train_semcom_phaseB.py. '
-                        'Omit for Phase A (identity JSCC).')
+                   help='Phase B/C checkpoint. Omit for Phase A (identity JSCC).')
+    p.add_argument('--phase', default='B', choices=['A', 'B', 'C'],
+                   help='SemCom phase. A=identity, B=JSCC-only, C=full fine-tune.')
     p.add_argument('--device', default='cuda')
     p.add_argument('--image_size', type=int, default=512, choices=[224, 512])
     p.add_argument('--server_port', type=int, default=7861,
@@ -297,6 +305,7 @@ if __name__ == '__main__':
             tmpdirname=tmpdirname,
             weights=args.weights,
             jscc_weights=args.jscc_weights,
+            phase=args.phase,
             device=args.device,
             image_size=args.image_size,
             server_name=server_name,

@@ -35,7 +35,11 @@ import torch
 # ── Path setup ────────────────────────────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(__file__))
 
-from dust3r.model_semcom import load_semcom_model, load_semcom_model_phaseB
+from dust3r.model_semcom import (
+    load_semcom_model,
+    load_semcom_model_phaseB,
+    load_semcom_model_phaseC,
+)
 from dust3r.inference import inference
 from dust3r.image_pairs import make_pairs
 from dust3r.utils.image import load_images
@@ -137,11 +141,26 @@ def run_experiment(args):
     pairs = make_pairs(imgs, scene_graph='complete', prefilter=None, symmetrize=True)
     n_imgs = len(imgs)
 
+    # ── Determine phase ─────────────────────────────────────────────────────
+    if args.phase == 'C':
+        phase_label = 'Phase C'
+    elif args.phase == 'B' or (args.phase is None and args.jscc_weights):
+        phase_label = 'Phase B'
+    else:
+        phase_label = 'Phase A'
+
+    print(f'[Experiment] Phase     : {phase_label}')
+
     # ── Run clean baseline first (SNR=inf) ────────────────────────────────────
     print('─' * 60)
     print('  Running CLEAN BASELINE (SNR = inf) ...')
-    model_clean = load_semcom_model(
-        args.weights, device, snr_db=float('inf'), verbose=False)
+    if phase_label == 'Phase C':
+        model_clean = load_semcom_model_phaseC(
+            args.weights, args.jscc_weights, device,
+            snr_db=float('inf'), verbose=False)
+    else:
+        model_clean = load_semcom_model(
+            args.weights, device, snr_db=float('inf'), verbose=False)
     with torch.no_grad():
         output_clean = inference(pairs, model_clean, device, batch_size=1, verbose=False)
     _, ga_loss_clean = run_global_alignment(
@@ -161,7 +180,11 @@ def run_experiment(args):
         snr_label = 'inf' if snr_db == float('inf') else f'{snr_db:.1f}'
         print(f'  SNR = {snr_label:>6} dB  |  loading model ...', end=' ', flush=True)
 
-        if args.jscc_weights:
+        if phase_label == 'Phase C':
+            model = load_semcom_model_phaseC(
+                args.weights, args.jscc_weights, device,
+                snr_db=snr_db, verbose=False)
+        elif phase_label == 'Phase B':
             model = load_semcom_model_phaseB(
                 args.weights, args.jscc_weights, device,
                 snr_db=snr_db, verbose=False)
@@ -200,7 +223,6 @@ def run_experiment(args):
         torch.cuda.empty_cache()
 
     # ── Summary table ─────────────────────────────────────────────────────────
-    phase_label = 'Phase B' if args.jscc_weights else 'Phase A'
     print('\n' + '=' * 60)
     print(f'  SUMMARY  ({args.channel.upper()} channel, {phase_label})')
     print('=' * 60)
@@ -227,7 +249,7 @@ def run_experiment(args):
         import json
         out_data = {
             'channel': args.channel,
-            'phase': 'B' if args.jscc_weights else 'A',
+            'phase': phase_label[-1],  # 'A', 'B', or 'C'
             'jscc_weights': args.jscc_weights,
             'images': image_paths,
             'baseline': {'mean_conf': conf_clean, 'ga_loss': ga_loss_clean},
@@ -264,10 +286,13 @@ def get_args():
     parser.add_argument('--output', default=None,
                         help='Save results to this JSON file')
     parser.add_argument('--jscc_weights', default=None,
-                        help='(Phase B) Path to JSCC checkpoint produced by '
-                             'train_semcom_phaseB.py.  When provided, the JSCC '
-                             'encoder/decoder is loaded from this file instead '
-                             'of using the Phase A identity mapping.')
+                        help='(Phase B/C) Path to JSCC or full-model checkpoint.'
+                             '  Phase B: produced by train_semcom_phaseB.py.'
+                             '  Phase C: produced by train_semcom_phaseC.py.')
+    parser.add_argument('--phase', default=None, choices=['A', 'B', 'C'],
+                        help='Explicitly set the phase (A/B/C).  '
+                             'If omitted, Phase A is assumed unless '
+                             '--jscc_weights is provided (→ Phase B).')
     return parser.parse_args()
 
 

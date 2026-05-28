@@ -56,7 +56,7 @@ def label_for(result: dict, path: str) -> str:
     phase   = result.get('phase', 'A')
     stem    = os.path.splitext(os.path.basename(path))[0]
     # Remove redundant phase tag from filename stem (desktop_phaseB_awgn → desktop_awgn)
-    stem_clean = stem.replace('_phaseB', '').replace('_phaseA', '')
+    stem_clean = stem.replace('_phaseC', '').replace('_phaseB', '').replace('_phaseA', '')
     return f"Phase {phase} {channel} ({stem_clean})"
 
 
@@ -70,8 +70,13 @@ def _make_title(phases: set) -> str:
         return 'DUSt3R + SemCom — Phase A: SNR Sweep Results'
     elif phases == {'B'}:
         return 'DUSt3R + SemCom — Phase B: SNR Sweep Results'
+    elif phases == {'C'}:
+        return 'DUSt3R + SemCom — Phase C: SNR Sweep Results'
+    elif phases == {'B', 'C'}:
+        return 'DUSt3R + SemCom — Phase B vs C Comparison: SNR Sweep'
     else:
-        return 'DUSt3R + SemCom — Phase A vs B Comparison: SNR Sweep'
+        sorted_phases = ''.join(sorted(phases))
+        return f'DUSt3R + SemCom — Phase {sorted_phases} Comparison: SNR Sweep'
 
 
 def _make_filename(phases: set) -> str:
@@ -79,8 +84,13 @@ def _make_filename(phases: set) -> str:
         return 'semcom_phaseA_results.png'
     elif phases == {'B'}:
         return 'semcom_phaseB_results.png'
+    elif phases == {'C'}:
+        return 'semcom_phaseC_results.png'
+    elif phases == {'B', 'C'}:
+        return 'semcom_phaseBC_comparison.png'
     else:
-        return 'semcom_phaseAB_comparison.png'
+        sorted_phases = ''.join(sorted(phases))
+        return f'semcom_phase{sorted_phases}_comparison.png'
 
 
 # ── Plot helpers ──────────────────────────────────────────────────────────────

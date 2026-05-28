@@ -1,5 +1,5 @@
 # =============================================================================
-# DUSt3R × SemCom — Phase A & B Experiment Makefile
+# DUSt3R × SemCom — Phase A, B & C Experiment Makefile
 # =============================================================================
 #
 # 常用指令速查
@@ -55,6 +55,25 @@ DESKTOP_PHASEB_RAYLEIGH_JSON := $(RESULTS_DIR)/desktop_phaseB_rayleigh.json
 BOOTS_PHASEB_AWGN_JSON       := $(RESULTS_DIR)/boots_phaseB_awgn.json
 BOOTS_PHASEB_RAYLEIGH_JSON   := $(RESULTS_DIR)/boots_phaseB_rayleigh.json
 
+# Phase C 訓練超參數
+PHASEC_FREEZE         := encoder          # none | encoder
+PHASEC_EPOCHS         := 50
+PHASEC_LR             := 1e-4
+PHASEC_BACKBONE_SCALE := 0.1
+PHASEC_BATCH          := 2
+PHASEC_ACCUM          := 8
+PHASEC_DATASET        ?=                  # 必須由使用者設定，例：ScanNetpp(...)
+
+# Phase C checkpoints
+JSCC_C_AWGN     := checkpoints/phaseC_awgn_k$(CHANNEL_DIM)/checkpoint-last.pth
+JSCC_C_RAYLEIGH := checkpoints/phaseC_rayleigh_k$(CHANNEL_DIM)/checkpoint-last.pth
+
+# Phase C 結果
+DESKTOP_PHASEC_AWGN_JSON     := $(RESULTS_DIR)/desktop_phaseC_awgn.json
+DESKTOP_PHASEC_RAYLEIGH_JSON := $(RESULTS_DIR)/desktop_phaseC_rayleigh.json
+BOOTS_PHASEC_AWGN_JSON       := $(RESULTS_DIR)/boots_phaseC_awgn.json
+BOOTS_PHASEC_RAYLEIGH_JSON   := $(RESULTS_DIR)/boots_phaseC_rayleigh.json
+
 # 圖片目錄（用於 Phase B 訓練）
 DESKTOP_DIR := dust3r/images/my_desktop
 BOOTS_DIR   := dust3r/images/timberland_boots
@@ -88,9 +107,13 @@ BOOTS_RAYLEIGH_JSON  := $(RESULTS_DIR)/boots_rayleigh.json
         train-phaseB-awgn train-phaseB-rayleigh train-phaseB-awgn-k256 \
         exp-phaseB-desktop-awgn exp-phaseB-desktop-rayleigh \
         exp-phaseB-boots-awgn exp-phaseB-boots-rayleigh exp-phaseB-all \
+        train-phaseC-awgn train-phaseC-rayleigh \
+        exp-phaseC-desktop-awgn exp-phaseC-desktop-rayleigh \
+        exp-phaseC-boots-awgn exp-phaseC-boots-rayleigh exp-phaseC-all \
         plot plot-desktop plot-boots plot-all-scenes \
         plot-phaseB plot-phaseB-desktop plot-phaseB-boots plot-phaseB-all-scenes \
-        demo demo-semcom demo-semcom-phaseB clean help dirs checkpoints
+        plot-phaseC plot-phaseC-desktop plot-phaseC-boots plot-phaseC-all-scenes \
+        demo demo-semcom demo-semcom-phaseB demo-semcom-phaseC clean help dirs checkpoints
 
 # ── 預設目標 ──────────────────────────────────────────────────────────────────
 all: exp plot
@@ -126,6 +149,19 @@ help:
 	@echo "  make plot-phaseB-boots      phaseB_boots/（boots AWGN vs Rayleigh）"
 	@echo "  make plot-phaseB-all-scenes phaseB_awgn/ 與 phaseB_rayleigh/（兩場景比較）"
 	@echo ""
+	@echo "【Phase C — End-to-End 聯合訓練，需有深度資料集】"
+	@echo "  make train-phaseC-awgn   PHASEC_DATASET=\"...\"   訓練 AWGN（需指定資料集）"
+	@echo "  make train-phaseC-rayleigh PHASEC_DATASET=\"...\" 訓練 Rayleigh"
+	@echo "  make exp-phaseC-desktop-awgn     Phase C 評估：desktop × AWGN"
+	@echo "  make exp-phaseC-desktop-rayleigh Phase C 評估：desktop × Rayleigh"
+	@echo "  make exp-phaseC-boots-awgn       Phase C 評估：boots × AWGN"
+	@echo "  make exp-phaseC-boots-rayleigh   Phase C 評估：boots × Rayleigh"
+	@echo "  make exp-phaseC-all              所有 Phase C 評估"
+	@echo "  make plot-phaseC                 Phase C 全部圖"
+	@echo "  make plot-phaseC-desktop         phaseC_desktop/"
+	@echo "  make plot-phaseC-boots           phaseC_boots/"
+	@echo "  make plot-phaseC-all-scenes      phaseC_awgn/ 與 phaseC_rayleigh/"
+	@echo ""
 	@echo "  make demo               啟動 Gradio Demo (port 7860)"
 	@echo "  make clean              刪除所有結果與圖片"
 	@echo ""
@@ -134,14 +170,9 @@ help:
 	@echo "    SNR_LIST=\"$(SNR_LIST)\""
 	@echo "    CHANNEL_DIM=$(CHANNEL_DIM)  TRAIN_EPOCHS=$(TRAIN_EPOCHS)  TRAIN_LR=$(TRAIN_LR)"
 	@echo "    TRAIN_LOSS=$(TRAIN_LOSS)  TRAIN_SNR=$(TRAIN_SNR)  TRAIN_SNR_RANGE=\"$(TRAIN_SNR_RANGE)\""
-	@echo "══════════════════════════════════════════════════════"
-	@echo ""
-	@echo "  make demo               啟動 Gradio Demo (port 7860)"
-	@echo "  make clean              刪除所有結果與圖片"
-	@echo ""
-	@echo "  可調整參數（預設值）："
-	@echo "    GPU=$(GPU)  IMAGE_SIZE=$(IMAGE_SIZE)  NITER=$(NITER)"
-	@echo "    SNR_LIST=\"$(SNR_LIST)\""
+	@echo "    PHASEC_FREEZE=$(PHASEC_FREEZE)  PHASEC_EPOCHS=$(PHASEC_EPOCHS)  PHASEC_LR=$(PHASEC_LR)"
+	@echo "    PHASEC_BACKBONE_SCALE=$(PHASEC_BACKBONE_SCALE)  PHASEC_BATCH=$(PHASEC_BATCH)  PHASEC_ACCUM=$(PHASEC_ACCUM)"
+	@echo "    PHASEC_DATASET=\"$(PHASEC_DATASET)\""
 	@echo "══════════════════════════════════════════════════════"
 
 # ── 建立輸出目錄 ──────────────────────────────────────────────────────────────
@@ -352,6 +383,142 @@ plot-phaseB-all-scenes: dirs
 		$(DESKTOP_PHASEB_RAYLEIGH_JSON) $(BOOTS_PHASEB_RAYLEIGH_JSON) \
 		--outdir $(FIGURES_DIR)/phaseB_rayleigh
 
+# ── Phase C 訓練目標 ───────────────────────────────────────────────────────────────
+
+# AWGN「迺迺 JSCC 自 Phase B，才能稱為 end-to-end 訓練」
+# 請先定義 PHASEC_DATASET：
+#   make train-phaseC-awgn PHASEC_DATASET="ScanNetpp(split='train', ROOT='data/scannetpp', resolution=512, aug_crop=16)"
+train-phaseC-awgn: dirs checkpoints
+	@if [ -z "$(PHASEC_DATASET)" ]; then \
+		echo "Error: PHASEC_DATASET 未設定！"; \
+		echo "  用法: make train-phaseC-awgn PHASEC_DATASET=\"ScanNetpp(split='train', ROOT='data/scannetpp', resolution=512, aug_crop=16)\""; \
+		exit 1; \
+	fi
+	@echo "\n▶  訓練 Phase C JSCC：AWGN, freeze=$(PHASEC_FREEZE), k=$(CHANNEL_DIM)"
+	$(ENV) $(PYTHON) train_semcom_phaseC.py \
+		--weights            $(WEIGHTS) \
+		--jscc_path          $(JSCC_AWGN_K512) \
+		--dataset            "$(PHASEC_DATASET)" \
+		--freeze             $(PHASEC_FREEZE) \
+		--channel            awgn \
+		--snr_range          $(TRAIN_SNR_RANGE) \
+		--channel_dim        $(CHANNEL_DIM) \
+		--epochs             $(PHASEC_EPOCHS) \
+		--lr                 $(PHASEC_LR) \
+		--backbone_lr_scale  $(PHASEC_BACKBONE_SCALE) \
+		--batch_size         $(PHASEC_BATCH) \
+		--accum_iter         $(PHASEC_ACCUM) \
+		--warmup_epochs      5 \
+		--amp \
+		--output_dir         checkpoints/phaseC_awgn_k$(CHANNEL_DIM)/
+
+# Rayleigh
+train-phaseC-rayleigh: dirs checkpoints
+	@if [ -z "$(PHASEC_DATASET)" ]; then \
+		echo "Error: PHASEC_DATASET 未設定！"; \
+		echo "  用法: make train-phaseC-rayleigh PHASEC_DATASET=\"ScanNetpp(split='train', ROOT='data/scannetpp', resolution=512, aug_crop=16)\""; \
+		exit 1; \
+	fi
+	@echo "\n▶  訓練 Phase C JSCC：Rayleigh, freeze=$(PHASEC_FREEZE), k=$(CHANNEL_DIM)"
+	$(ENV) $(PYTHON) train_semcom_phaseC.py \
+		--weights            $(WEIGHTS) \
+		--jscc_path          $(JSCC_RAYLEIGH_K512) \
+		--dataset            "$(PHASEC_DATASET)" \
+		--freeze             $(PHASEC_FREEZE) \
+		--channel            rayleigh \
+		--snr_range          $(TRAIN_SNR_RANGE) \
+		--channel_dim        $(CHANNEL_DIM) \
+		--epochs             $(PHASEC_EPOCHS) \
+		--lr                 $(PHASEC_LR) \
+		--backbone_lr_scale  $(PHASEC_BACKBONE_SCALE) \
+		--batch_size         $(PHASEC_BATCH) \
+		--accum_iter         $(PHASEC_ACCUM) \
+		--warmup_epochs      5 \
+		--amp \
+		--output_dir         checkpoints/phaseC_rayleigh_k$(CHANNEL_DIM)/
+
+# ── Phase C 評估目標 ───────────────────────────────────────────────────────────────
+
+exp-phaseC-desktop-awgn: dirs
+	@echo "\n▶  Phase C 評估：my_desktop × AWGN"
+	$(ENV) $(EXP_SCRIPT) \
+		--weights      $(WEIGHTS) \
+		--jscc_weights $(JSCC_C_AWGN) \
+		--phase        C \
+		--images       $(DESKTOP_IMGS) \
+		--snr_list     $(SNR_LIST) \
+		--channel      awgn \
+		--image_size   $(IMAGE_SIZE) \
+		--niter        $(NITER) \
+		--output       $(DESKTOP_PHASEC_AWGN_JSON)
+
+exp-phaseC-desktop-rayleigh: dirs
+	@echo "\n▶  Phase C 評估：my_desktop × Rayleigh"
+	$(ENV) $(EXP_SCRIPT) \
+		--weights      $(WEIGHTS) \
+		--jscc_weights $(JSCC_C_RAYLEIGH) \
+		--phase        C \
+		--images       $(DESKTOP_IMGS) \
+		--snr_list     $(SNR_LIST) \
+		--channel      rayleigh \
+		--image_size   $(IMAGE_SIZE) \
+		--niter        $(NITER) \
+		--output       $(DESKTOP_PHASEC_RAYLEIGH_JSON)
+
+exp-phaseC-boots-awgn: dirs
+	@echo "\n▶  Phase C 評估：timberland_boots × AWGN"
+	$(ENV) $(EXP_SCRIPT) \
+		--weights      $(WEIGHTS) \
+		--jscc_weights $(JSCC_C_AWGN) \
+		--phase        C \
+		--images       $(BOOTS_IMGS) \
+		--snr_list     $(SNR_LIST) \
+		--channel      awgn \
+		--image_size   $(IMAGE_SIZE) \
+		--niter        $(NITER) \
+		--output       $(BOOTS_PHASEC_AWGN_JSON)
+
+exp-phaseC-boots-rayleigh: dirs
+	@echo "\n▶  Phase C 評估：timberland_boots × Rayleigh"
+	$(ENV) $(EXP_SCRIPT) \
+		--weights      $(WEIGHTS) \
+		--jscc_weights $(JSCC_C_RAYLEIGH) \
+		--phase        C \
+		--images       $(BOOTS_IMGS) \
+		--snr_list     $(SNR_LIST) \
+		--channel      rayleigh \
+		--image_size   $(IMAGE_SIZE) \
+		--niter        $(NITER) \
+		--output       $(BOOTS_PHASEC_RAYLEIGH_JSON)
+
+exp-phaseC-all: exp-phaseC-desktop-awgn exp-phaseC-desktop-rayleigh \
+                exp-phaseC-boots-awgn   exp-phaseC-boots-rayleigh
+
+# ── Phase C 繪圖目標 ───────────────────────────────────────────────────────────────
+
+plot-phaseC: plot-phaseC-desktop plot-phaseC-boots plot-phaseC-all-scenes
+
+plot-phaseC-desktop: dirs
+	@echo "\n▶  繪圖：my_desktop（Phase C）"
+	$(PLOT_SCRIPT) \
+		$(DESKTOP_PHASEC_AWGN_JSON) $(DESKTOP_PHASEC_RAYLEIGH_JSON) \
+		--outdir $(FIGURES_DIR)/phaseC_desktop
+
+plot-phaseC-boots: dirs
+	@echo "\n▶  繪圖：timberland_boots（Phase C）"
+	$(PLOT_SCRIPT) \
+		$(BOOTS_PHASEC_AWGN_JSON) $(BOOTS_PHASEC_RAYLEIGH_JSON) \
+		--outdir $(FIGURES_DIR)/phaseC_boots
+
+plot-phaseC-all-scenes: dirs
+	@echo "\n▶  繪圖：兩場景 AWGN 比較（Phase C）"
+	$(PLOT_SCRIPT) \
+		$(DESKTOP_PHASEC_AWGN_JSON) $(BOOTS_PHASEC_AWGN_JSON) \
+		--outdir $(FIGURES_DIR)/phaseC_awgn
+	$(PLOT_SCRIPT) \
+		$(DESKTOP_PHASEC_RAYLEIGH_JSON) $(BOOTS_PHASEC_RAYLEIGH_JSON) \
+		--outdir $(FIGURES_DIR)/phaseC_rayleigh
+
 # ── Demo ─────────────────────────────────────────────────────────────────────
 demo:
 	@echo "\n▶  啟動 Gradio Demo（GPU=$(GPU)，port 7860）"
@@ -360,7 +527,7 @@ demo:
 		--image_size $(IMAGE_SIZE)
 
 demo-semcom:
-	@echo "\n▶  啟動 SemCom Demo（GPU=$(GPU)，port 7861，Phase A）"
+	@echo "\n▶  啟動 SemCom Demo（GPU=$(GPU)，port 7860，Phase A）"
 	$(ENV) $(PYTHON) demo_semcom.py \
 		--weights    $(WEIGHTS) \
 		--image_size $(IMAGE_SIZE) \
@@ -373,6 +540,15 @@ demo-semcom-phaseB:
 		--jscc_weights $(JSCC_AWGN_K512) \
 		--image_size   $(IMAGE_SIZE) \
 		--server_port  7861
+
+demo-semcom-phaseC:
+	@echo "\n▶  啟動 SemCom Demo（GPU=$(GPU)，port 7862，Phase C）"
+	$(ENV) $(PYTHON) demo_semcom.py \
+		--weights      $(WEIGHTS) \
+		--jscc_weights $(JSCC_C_AWGN) \
+		--phase        C \
+		--image_size   $(IMAGE_SIZE) \
+		--server_port  7862
 
 # ── 清理 ─────────────────────────────────────────────────────────────────────
 clean:
