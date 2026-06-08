@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
 """
-Phase A SemCom Experiment: SNR Sweep for DUSt3R
-================================================
+SemCom SNR Sweep Experiment for DUSt3R
+=======================================
 Evaluates how AWGN / Rayleigh channel noise applied to encoder tokens
 affects DUSt3R reconstruction quality and Global Alignment.
 
 Usage
 -----
-# Quick test with the built-in Chateau stereo pair:
+# Noise-only baseline (no trained JSCC), Chateau stereo pair:
   CUDA_VISIBLE_DEVICES=1 python experiment_semcom.py \
       --weights checkpoints/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth
 
-# Custom image folder (≥2 images of the same scene):
+# With trained JSCC checkpoint (from train_jscc.py or train_e2e.py):
   CUDA_VISIBLE_DEVICES=1 python experiment_semcom.py \
-      --weights checkpoints/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth \
-      --images path/to/img1.jpg path/to/img2.jpg path/to/img3.jpg
+      --weights      checkpoints/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth \
+      --jscc_weights checkpoints/jscc_awgn_k512.pth
 
 # Change SNR sweep and channel type:
   CUDA_VISIBLE_DEVICES=1 python experiment_semcom.py \
-      --weights checkpoints/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth \
+      --weights  checkpoints/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth \
       --snr_list inf 20 15 10 5 0 -5 \
-      --channel rayleigh
+      --channel  rayleigh
 """
 
 import argparse
@@ -35,11 +35,7 @@ import torch
 # ── Path setup ────────────────────────────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(__file__))
 
-from dust3r.model_semcom import (
-    load_semcom_model,
-    load_semcom_model_phaseB,
-    load_semcom_model_phaseC,
-)
+from dust3r.model_semcom import load_semcom_model
 from dust3r.inference import inference
 from dust3r.image_pairs import make_pairs
 from dust3r.utils.image import load_images
@@ -141,26 +137,12 @@ def run_experiment(args):
     pairs = make_pairs(imgs, scene_graph='complete', prefilter=None, symmetrize=True)
     n_imgs = len(imgs)
 
-    # ── Determine phase ─────────────────────────────────────────────────────
-    if args.phase == 'C':
-        phase_label = 'Phase C'
-    elif args.phase == 'B' or (args.phase is None and args.jscc_weights):
-        phase_label = 'Phase B'
-    else:
-        phase_label = 'Phase A'
-
-    print(f'[Experiment] Phase     : {phase_label}')
-
     # ── Run clean baseline first (SNR=inf) ────────────────────────────────────
     print('─' * 60)
     print('  Running CLEAN BASELINE (SNR = inf) ...')
-    if phase_label == 'Phase C':
-        model_clean = load_semcom_model_phaseC(
-            args.weights, args.jscc_weights, device,
-            snr_db=float('inf'), verbose=False)
-    else:
-        model_clean = load_semcom_model(
-            args.weights, device, snr_db=float('inf'), verbose=False)
+    model_clean = load_semcom_model(
+        args.weights, device, snr_db=float('inf'),
+        jscc_path=args.jscc_weights, verbose=False)
     with torch.no_grad():
         output_clean = inference(pairs, model_clean, device, batch_size=1, verbose=False)
     _, ga_loss_clean = run_global_alignment(
@@ -180,18 +162,10 @@ def run_experiment(args):
         snr_label = 'inf' if snr_db == float('inf') else f'{snr_db:.1f}'
         print(f'  SNR = {snr_label:>6} dB  |  loading model ...', end=' ', flush=True)
 
-        if phase_label == 'Phase C':
-            model = load_semcom_model_phaseC(
-                args.weights, args.jscc_weights, device,
-                snr_db=snr_db, verbose=False)
-        elif phase_label == 'Phase B':
-            model = load_semcom_model_phaseB(
-                args.weights, args.jscc_weights, device,
-                snr_db=snr_db, verbose=False)
-        else:
-            model = load_semcom_model(
-                args.weights, device,
-                snr_db=snr_db, channel=args.channel, verbose=False)
+        model = load_semcom_model(
+            args.weights, device,
+            snr_db=snr_db, channel=args.channel,
+            jscc_path=args.jscc_weights, verbose=False)
 
         with torch.no_grad():
             output = inference(pairs, model, device, batch_size=1, verbose=False)
@@ -223,8 +197,9 @@ def run_experiment(args):
         torch.cuda.empty_cache()
 
     # ── Summary table ─────────────────────────────────────────────────────────
+    mode = 'JSCC' if args.jscc_weights else 'noise-only'
     print('\n' + '=' * 60)
-    print(f'  SUMMARY  ({args.channel.upper()} channel, {phase_label})')
+    print(f'  SUMMARY  ({args.channel.upper()} channel, {mode})')
     print('=' * 60)
     header = f'  {"SNR (dB)":>10}  {"mean_conf":>10}  {"pts3d_MSE":>12}  {"GA_loss":>12}'
     print(header)
@@ -249,7 +224,7 @@ def run_experiment(args):
         import json
         out_data = {
             'channel': args.channel,
-            'phase': phase_label[-1],  # 'A', 'B', or 'C'
+            'jscc_mode': 'jscc' if args.jscc_weights else 'noise-only',
             'jscc_weights': args.jscc_weights,
             'images': image_paths,
             'baseline': {'mean_conf': conf_clean, 'ga_loss': ga_loss_clean},
@@ -268,7 +243,7 @@ def run_experiment(args):
 
 def get_args():
     parser = argparse.ArgumentParser(
-        description='Phase A SemCom SNR sweep for DUSt3R',
+        description='SemCom SNR sweep experiment for DUSt3R',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('--weights', required=True,
                         help='Path to DUSt3R checkpoint (.pth)')
@@ -286,13 +261,9 @@ def get_args():
     parser.add_argument('--output', default=None,
                         help='Save results to this JSON file')
     parser.add_argument('--jscc_weights', default=None,
-                        help='(Phase B/C) Path to JSCC or full-model checkpoint.'
-                             '  Phase B: produced by train_semcom_phaseB.py.'
-                             '  Phase C: produced by train_semcom_phaseC.py.')
-    parser.add_argument('--phase', default=None, choices=['A', 'B', 'C'],
-                        help='Explicitly set the phase (A/B/C).  '
-                             'If omitted, Phase A is assumed unless '
-                             '--jscc_weights is provided (→ Phase B).')
+                        help='Path to a JSCC or full-model checkpoint '
+                             '(from train_jscc.py or train_e2e.py). '
+                             'Omit for noise-only (identity JSCC) mode.')
     return parser.parse_args()
 
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Visualize DUSt3R + SemCom Phase C reconstruction quality.
+Visualize DUSt3R + SemCom reconstruction quality.
 
 For each requested SNR level, runs inference + global alignment and saves:
   - A side-by-side comparison PNG  (RGB | Depth | Confidence) per view
@@ -10,15 +10,13 @@ Usage
 -----
   CUDA_VISIBLE_DEVICES=1 python visualize_reconstruction.py \\
       --weights    checkpoints/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth \\
-      --jscc_weights checkpoints/phaseC_awgn_k512/checkpoint-last.pth \\
+      --jscc_weights checkpoints/jscc_awgn_k512.pth \\
       --images  dust3r/images/my_desktop/1.png dust3r/images/my_desktop/2.png \\
                 dust3r/images/my_desktop/3.png dust3r/images/my_desktop/4.png \\
                 dust3r/images/my_desktop/5.png \\
       --snr_list inf 20 10 0 \\
       --scene_name desktop \\
-      --outdir figures/reconstruction_phaseC/
-
-Supported --phase: B or C (default C).
+      --outdir figures/reconstruction/
 """
 
 import argparse
@@ -42,28 +40,18 @@ from dust3r.utils.image import load_images, rgb
 from dust3r.utils.device import to_numpy
 from dust3r.cloud_opt import global_aligner, GlobalAlignerMode
 from dust3r.demo import get_3D_model_from_scene
-from dust3r.model_semcom import (
-    load_semcom_model_phaseB,
-    load_semcom_model_phaseC,
-)
+from dust3r.model_semcom import load_semcom_model
 
 
 # ── Model loading ─────────────────────────────────────────────────────────────
 
 def load_model(args, device: str, snr_db: float):
-    """Load Phase B or C model at the given SNR."""
-    if args.phase.upper() == 'C':
-        return load_semcom_model_phaseC(
-            args.weights, args.jscc_weights, device,
-            snr_db=snr_db, verbose=False,
-        )
-    elif args.phase.upper() == 'B':
-        return load_semcom_model_phaseB(
-            args.weights, args.jscc_weights, device,
-            snr_db=snr_db, verbose=False,
-        )
-    else:
-        raise ValueError(f'Unknown phase "{args.phase}". Choose B or C.')
+    """Load unified SemCom model at the given SNR."""
+    return load_semcom_model(
+        args.weights, device,
+        snr_db=snr_db, channel=args.channel,
+        jscc_path=args.jscc_weights, verbose=False,
+    )
 
 
 # ── Reconstruction ────────────────────────────────────────────────────────────
@@ -99,7 +87,7 @@ def _norm(arr):
     return (arr - mn) / (mx - mn + 1e-8)
 
 
-def save_comparison_png(snr_labels, scenes, outpath, scene_name):
+def save_comparison_png(snr_labels, scenes, outpath, scene_name, channel, mode_label):
     """
     Save comparison grid: each column = one SNR level.
     Each column has 3 sub-columns: RGB | Depth | Confidence.
@@ -124,7 +112,7 @@ def save_comparison_png(snr_labels, scenes, outpath, scene_name):
         squeeze=False,
     )
     fig.suptitle(
-        f'{scene_name} — Phase {args.phase.upper()} ({args.channel.upper()}) '
+        f'{scene_name} — {mode_label} ({channel.upper()}) '
         f'Reconstruction Quality',
         fontsize=13, fontweight='bold', y=1.01,
     )
@@ -153,7 +141,7 @@ def save_comparison_png(snr_labels, scenes, outpath, scene_name):
     print(f'[Saved] {outpath}')
 
 
-def save_single_snr_png(scene, snr_label, outpath, scene_name):
+def save_single_snr_png(scene, snr_label, outpath, scene_name, channel, mode_label):
     """
     Save per-SNR detail view: each row = one view,
     columns = [RGB, Depth, Confidence].
@@ -166,7 +154,7 @@ def save_single_snr_png(scene, snr_label, outpath, scene_name):
     fig, axes = plt.subplots(n_views, 3, figsize=(10, n_views * 3), squeeze=False)
     label = 'clean (no channel)' if snr_label == 'inf' else f'SNR = {snr_label} dB'
     fig.suptitle(
-        f'{scene_name} — {label} ({args.phase.upper()} {args.channel.upper()})',
+        f'{scene_name} — {label} ({mode_label} {channel.upper()})',
         fontsize=12, fontweight='bold',
     )
     for vi in range(n_views):
@@ -195,10 +183,9 @@ def parse_args():
     )
     p.add_argument('--weights', required=True,
                    help='DUSt3R backbone checkpoint (.pth).')
-    p.add_argument('--jscc_weights', required=True,
-                   help='Phase B/C JSCC checkpoint (.pth).')
-    p.add_argument('--phase', default='C', choices=['B', 'C'],
-                   help='SemCom phase to evaluate.')
+    p.add_argument('--jscc_weights', default=None,
+                   help='JSCC checkpoint (from train_jscc.py or train_e2e.py). '
+                        'Omit for noise-only (identity JSCC) mode.')
     p.add_argument('--images', nargs='+', required=True,
                    help='Input image paths (≥2 images of the same scene).')
     p.add_argument('--snr_list', nargs='+', default=['inf', '20', '10', '0'],
@@ -222,6 +209,7 @@ if __name__ == '__main__':
 
     device = args.device
     scene_name = args.scene_name
+    mode_label = 'JSCC' if args.jscc_weights else 'noise-only'
 
     # Parse SNR list
     snr_values = []
@@ -252,9 +240,10 @@ if __name__ == '__main__':
         # Per-SNR detail PNG
         detail_path = os.path.join(
             args.outdir,
-            f'{scene_name}_phase{args.phase}_{args.channel}_snr{snr_label}.png',
+            f'{scene_name}_{mode_label}_{args.channel}_snr{snr_label}.png',
         )
-        save_single_snr_png(scene, snr_label, detail_path, scene_name)
+        save_single_snr_png(scene, snr_label, detail_path, scene_name,
+                            args.channel, mode_label)
 
         # 3D mesh GLB
         if args.save_glb:
@@ -267,7 +256,7 @@ if __name__ == '__main__':
                 )
                 glb_dst = os.path.join(
                     args.outdir,
-                    f'{scene_name}_phase{args.phase}_{args.channel}_snr{snr_label}.glb',
+                    f'{scene_name}_{mode_label}_{args.channel}_snr{snr_label}.glb',
                 )
                 import shutil
                 shutil.copy(glb_src, glb_dst)
@@ -280,8 +269,9 @@ if __name__ == '__main__':
     if len(scenes) > 1:
         grid_path = os.path.join(
             args.outdir,
-            f'{scene_name}_phase{args.phase}_{args.channel}_comparison.png',
+            f'{scene_name}_{mode_label}_{args.channel}_comparison.png',
         )
-        save_comparison_png(snr_labels, scenes, grid_path, scene_name)
+        save_comparison_png(snr_labels, scenes, grid_path, scene_name,
+                            args.channel, mode_label)
 
     print(f'\nAll outputs saved to: {args.outdir}')
