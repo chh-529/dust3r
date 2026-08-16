@@ -102,12 +102,6 @@ def power_normalize(signal: torch.Tensor,
                     allow_less_power: bool = False,
                     eps: float = 1e-12) -> torch.Tensor:
     """
-    Scale each signal in the batch so its average power per complex symbol equals
-    `power_constraint`, i.e. after this call  E[|z_k|^2] == power_constraint.
-
-    This is what makes the SNR of a channel meaningful: without it, the encoder could
-    trivially "beat" the noise by emitting a huge-amplitude signal.
-
     Args:
         signal: real or complex tensor of shape (*batch, L). Normalized independently
             per batch element (the reduction is over the last dim only).

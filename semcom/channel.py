@@ -1,44 +1,25 @@
 """
 Channel models for SemCom. AWGN only (see NOTE at the bottom on extending to fading).
 
-Conventions
------------
-A signal tensor always keeps the complex symbol stream in its LAST dimension.
-Everything before that is a batch dimension, except for one distinguished
-"user dimension" in the multi-user case, whose position is passed explicitly as
-`user_dim_index` (it is *not* assumed to be dim 0, because the caller may want
-(batch, n_tx, L) or (n_tx, batch, L) depending on how the system model stacks things).
-
 Single user (point to point):
-    y = x + n                       shape (*batch, L) -> (*batch, L)
+
+    y = x + n                             shape (*batch, L) -> (*batch, L)
 
 Multi user uplink (superposition / non-orthogonal multiple access):
-    y = sum_t h_t * x_t + n         shape (*d1, n_tx, *d2, L) -> (*d1, *d2, L)
-    All transmitters occupy the SAME L symbols at the same time. The receiver gets
-    one superimposed stream and the semantic decoders must pull the users apart --
-    that separation is learned, there is no explicit multi-user detector here.
 
-    There is one receiver, therefore one antenna and ONE noise realization: users do
-    not get "their own noise". Different link qualities per user (the near-far effect)
-    are modelled by the per-user gain h_t instead; pass a per-user snr_db list and the
-    channel solves for the h_t that realize them.
+    y = sum_k (a_k * h_k * x_k) + n       shape (*d1, n_tx, *d2, L) -> (*d1, *d2, L)
 
-Noise model
------------
-n ~ CN(0, sigma^2), circularly symmetric complex Gaussian: the real and the
-imaginary part are independent N(0, sigma^2 / 2), so E[|n|^2] == sigma^2.
-sigma^2 is derived from the SNR:  sigma^2 = P_ref / 10^(snr_db / 10).
+    a_k : power_alloc[k]**0.5  -- power-domain NOMA knob, x_k is always unit power
+    h_k : channel_gain[k]      -- near-far / heterogeneous-SNR knob (path loss etc.)
 
-What P_ref is, is a real modelling choice once more than one user transmits --
-see `snr_reference` in AWGNMultiUplinkChannel.
+    Both are constants of the channel (fixed at construction), not measured from
+    what happens to be transmitted. There is one receiver, therefore one noise
+    realization shared by every user.
 """
-from typing import Literal, Optional, Sequence, Tuple
 
+from typing import Optional, Sequence, Tuple
 import torch
-
 from .utils import get_class_str, signal_power
-
-SNRReference = Literal['received', 'per_user']
 
 
 def make_complex_gaussian_noise(signal: torch.Tensor,
@@ -193,139 +174,103 @@ class AWGNSingleChannel(SingleChannel):
 
 class AWGNMultiUplinkChannel(MultiUplinkChannel):
     """
-    Superposition uplink:  y = sum_{t=1..n_tx} h_t * x_t + n,   n ~ CN(0, sigma^2)
+    y = sum_k (a_k * h_k * x_k) + n,   n ~ CN(0, sigma^2)
 
-    This is the channel in the architecture diagram: transmitter 1 and transmitter 2
-    send z1 and z2 over the same resource, the receiver observes z1' + z2'.
+    a_k : power_alloc[k]**0.5  -- power-domain NOMA knob
+    h_k : channel_gain[k]      -- near-far / heterogeneous-SNR knob
 
-    There is exactly ONE receiver, hence ONE antenna, ONE RF chain and ONE noise
-    realization -- sigma^2 is a property of the receiver hardware, not of a user.
-    Users therefore cannot have "their own noise". Heterogeneous link quality is
-    modelled where it physically lives: in the per-user gain h_t (path loss /
-    shadowing), which makes the users arrive at the receiver with different powers:
-
-        SNR_t = |h_t|^2 * P_t / sigma^2
-
-    Homogeneous case (scalar snr_db): h_t == 1 for every user.
-    Heterogeneous case (snr_db is a length-n_tx sequence): h_t is solved for, so that
-    each user hits its requested received SNR. See _solve_user_gain().
+    sigma^2 comes from exactly one of two places (mutually exclusive):
+        snr_db       measured against the superimposed signal each forward -- the
+                     "give me an SNR knob" case (homogeneous / NOMA).
+        noise_power  a fixed constant, not measured -- what make_channel_gain() uses,
+                     because once sigma^2 is fixed, solving h_k for a target per-user
+                     SNR is a one-line closed form instead of an approximation.
     """
 
     def __init__(self,
                  n_tx: int,
-                 snr_db: float | Sequence[float] | torch.Tensor,
-                 snr_reference: SNRReference = 'per_user',
+                 snr_db: Optional[float] = None,
+                 power_alloc: Optional[Sequence[float]] = None,
+                 channel_gain: Optional[Sequence[float]] = None,
+                 noise_power: Optional[float] = None,
                  keep_last_noise: bool = False):
         """
         Args:
-            n_tx: number of transmitters (users) that superimpose.
-            snr_db: SNR in dB at the single receiver.
-                - a float: every user arrives with the same SNR (h_t == 1).
-                - a length-n_tx sequence / 1-D tensor: the RECEIVED SNR of each user,
-                  i.e. the near-far / heterogeneous-channel setting. The channel then
-                  applies a per-user gain to realize them; `snr_reference` is forced to
-                  'per_user' because each user's SNR is stated explicitly.
-            snr_reference: WHICH power the SNR is measured against. This matters as soon
-                as n_tx > 1, and it decides how your SNR curves should be read:
-
-                'per_user' (default): sigma^2 = mean_t E[|x_t|^2] / snr_linear.
-                    "10 dB" means each user arrives 10 dB above the noise. Adding a second
-                    user then does NOT change the noise floor, so a 1-user run and a
-                    2-user run at the same nominal SNR are directly comparable and the
-                    only thing that changed is the mutual interference. This is what you
-                    want for the "superposition vs. orthogonal" comparison.
-
-                'received': sigma^2 = E[|sum_t x_t|^2] / snr_linear, i.e. measured on the
-                    superimposed waveform (what a receiver's AGC would actually see).
-                    With n_tx users this makes the noise ~n_tx times stronger than the
-                    'per_user' setting at the same nominal SNR. This matches the
-                    reference implementation in references/semcom/paper_src/channel.py.
-
-            keep_last_noise: see AWGNSingleChannel.
+            n_tx:               number of transmitters (users) that superimpose.
+            snr_db:             SNR in dB against the measured superimposed signal.
+            power_alloc:        a_k^2, the NOMA power split.
+            channel_gain:       h_k, per-user channel gain (real amplitude; phase 0,
+                                since there is no equalizer downstream to undo it).
+            noise_power:        sigma^2, used as-is every forward instead of snr_db.
+            keep_last_noise:    see AWGNSingleChannel.
         """
         if n_tx < 1:
             raise ValueError(f'{n_tx = } must be >= 1')
-        if snr_reference not in ('per_user', 'received'):
-            raise ValueError(f'invalid {snr_reference = }')
-
-        if isinstance(snr_db, (list, tuple)):
-            snr_db = torch.tensor(snr_db, dtype=torch.float32)
-        # a 1-D tensor of length n_tx means "one SNR per user"; anything else is a scalar
-        self.per_user_snr = isinstance(snr_db, torch.Tensor) and snr_db.numel() == n_tx > 1
-        if self.per_user_snr:
-            if snr_db.dim() != 1:
-                raise ValueError(f'per-user snr_db must be 1-D, got {snr_db.size()}')
-            if snr_reference == 'received':
-                raise ValueError("snr_reference='received' is meaningless with per-user "
-                                 "snr_db: each user's SNR is already stated explicitly")
+        if (snr_db is None) == (noise_power is None):
+            raise ValueError('give exactly one of snr_db, noise_power')
+        if isinstance(snr_db, torch.Tensor) and snr_db.numel() > 1:
+            raise ValueError('snr_db must be a scalar; for per-user target SNR use '
+                             'AWGNMultiUplinkChannel.make_channel_gain()')
 
         self.n_tx = n_tx
-        self.snr_db = snr_db
-        self.snr_reference = snr_reference
+        self.snr_db = None if snr_db is None else float(snr_db)
+        self.noise_power = None if noise_power is None else float(noise_power)
+        self.power_alloc = self._as_vector(power_alloc, n_tx, default=1.0)
+        self.channel_gain = self._as_vector(channel_gain, n_tx, default=1.0)
         self.keep_last_noise = keep_last_noise
         self.last_noise: Optional[torch.Tensor] = None
-        self.last_user_gain: Optional[torch.Tensor] = None
+        self.last_effective_gain: Optional[torch.Tensor] = None
+
+    @staticmethod
+    def _as_vector(x, n: int, default: float) -> torch.Tensor:
+        if x is None:
+            return torch.full((n,), default, dtype=torch.float32)
+        x = torch.as_tensor(x, dtype=torch.float32)
+        if x.numel() != n:
+            raise ValueError(f'expected length {n}, got {x.numel()}')
+        return x
 
     def __str__(self):
         return get_class_str(self, n_tx=self.n_tx, snr_db=self.snr_db,
-                             snr_reference=self.snr_reference)
+                             noise_power=self.noise_power,
+                             power_alloc=self.power_alloc.tolist(),
+                             channel_gain=self.channel_gain.tolist())
 
     __repr__ = __str__
 
-    def _solve_user_gain(self, signal: torch.Tensor,
-                         user_dim_index: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    @classmethod
+    def make_channel_gain(cls, n_tx: int, target_snr_db: Sequence[float],
+                          power_alloc: Optional[Sequence[float]] = None,
+                          noise_power: float = 1.0,
+                          keep_last_noise: bool = False) -> 'AWGNMultiUplinkChannel':
         """
-        Heterogeneous case: find the per-user gains h_t and the noise power sigma^2 that
-        realize the requested per-user received SNRs.
+        Fix sigma^2 = noise_power and solve channel_gain so user k's received SNR is
+        EXACTLY target_snr_db[k] -- exact, not approximate, because sigma^2 is a
+        constant here rather than something measured from the transmitted signal:
 
-        Let p_t = E[|x_t|^2] be what user t transmits (measured from the signal), and
-        s_t = 10^(snr_db[t] / 10) the requested linear SNR. We need the received power
-        q_t = |h_t|^2 * p_t to satisfy q_t / sigma^2 == s_t. That is n_tx equations in
-        n_tx + 1 unknowns, so one more condition pins the absolute scale; we keep the
-        TOTAL received power unchanged, sum_t q_t == sum_t p_t:
+            a_k^2 |h_k|^2 / sigma^2 == s_k     (s_k = 10^(target_snr_db[k]/10))
+            |h_k|^2 = s_k * sigma^2 / a_k^2
 
-            sigma^2   = mean_t(p_t) / mean_t(s_t)
-            |h_t|^2   = s_t * sigma^2 / p_t
-
-        Only the ratios q_t : sigma^2 affect the system (they are what SNR and SINR are
-        made of), so this extra condition is free; keeping the received power stable
-        across configurations just makes training better behaved.
-
-        Sanity check -- if every s_t == s and every p_t == p, this gives sigma^2 = p / s
-        and h_t == 1, i.e. exactly the homogeneous channel.
-
-        Returns:
-            gain: real tensor of shape (*d1, n_tx, *d2, 1), broadcasting over the symbols
-            noise_power: real tensor of shape (*d1, *d2, 1)
-
-        Note:
-            The measured power is detached: the gain is a property of the environment,
-            not something the encoder should be able to steer via its own amplitude.
-            In practice the system model power_normalize()s before transmitting, so
-            p_t is just the power constraint P_t.
+        power_alloc defaults to a_k == 1 (no NOMA, pure near-far). Equal targets
+        reduce to h_k == 1, the homogeneous channel.
         """
-        # (*d1, n_tx, *d2, 1)
-        p = signal_power(signal, keepdim=True).detach()
+        target = torch.as_tensor(target_snr_db, dtype=torch.float32)
+        if target.numel() != n_tx:
+            raise ValueError(f'{target.numel() = } != {n_tx = }')
+        a2 = cls._as_vector(power_alloc, n_tx, default=1.0)
 
-        # reshape snr to (1, ..., n_tx, ..., 1) so it lines up with the user dimension
-        view = [1] * signal.dim()
-        view[user_dim_index] = self.n_tx
-        s = torch.pow(10.0, self.snr_db.to(signal.device, torch.float32) / 10.0).view(view)
+        s = torch.pow(10.0, target / 10.0)
+        h2 = s * noise_power / a2.clamp_min(1e-12)
 
-        noise_power = p.mean(dim=user_dim_index, keepdim=True) / s.mean()
-        gain = torch.sqrt(s * noise_power / p.clamp_min(1e-12))
-
-        return gain, noise_power.squeeze(user_dim_index)
+        return cls(n_tx, power_alloc=a2, channel_gain=torch.sqrt(h2),
+                  noise_power=noise_power, keep_last_noise=keep_last_noise)
 
     def interfere(self, signal: torch.Tensor, user_dim_index: int = 0,
                   noise: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Args:
-            signal: complex tensor of shape (*d1, n_tx, *d2, L); `user_dim_index` is the
-                index of the n_tx dimension (may be negative-free only: use a
-                non-negative index, it is also used to place the reduced dims).
-            user_dim_index: position of the user dimension. Defaults to 0.
-            noise: optional pre-drawn noise of shape (*d1, *d2, L), for reproducibility.
+            signal: complex tensor of shape (*d1, n_tx, *d2, L);
+            noise:  optional pre-drawn noise of shape (*d1, *d2, L), for reproducibility.
 
         Returns:
             complex tensor of shape (*d1, *d2, L) -- one superimposed, noisy stream,
@@ -336,29 +281,25 @@ class AWGNMultiUplinkChannel(MultiUplinkChannel):
         if signal.size(user_dim_index) != self.n_tx:
             raise ValueError(f'{signal.size(user_dim_index) = } != {self.n_tx = }')
 
-        noise_power = None
-        if self.per_user_snr:
-            # heterogeneous links: attenuate/amplify each user, then one shared noise
-            gain, noise_power = self._solve_user_gain(signal, user_dim_index)
-            self.last_user_gain = gain.detach().to('cpu')
-            signal = signal * gain
-            reference_power = None
-        elif self.snr_reference == 'per_user':
-            # reference power is computed BEFORE summing, so 'per_user' is exact rather
-            # than relying on E|sum x_t|^2 == sum E|x_t|^2 (true only for uncorrelated users)
-            # (*d1, n_tx, *d2, 1) -> (*d1, *d2, 1)
-            reference_power = signal_power(signal, keepdim=True).mean(dim=user_dim_index)
-        else:
-            reference_power = None
+        view = [1] * signal.dim()
+        view[user_dim_index] = self.n_tx
+        a = torch.sqrt(self.power_alloc.to(signal.device))
+        h = self.channel_gain.to(signal.device)
+        g = (a * h).view(view)                                  # a_k * h_k
+        self.last_effective_gain = g.detach().to('cpu')
 
-        # the superposition itself: this single line IS the multiple access channel
+        signal = signal * g.to(signal.dtype)
         received = torch.sum(signal, dim=user_dim_index)        # (*d1, *d2, L)
 
         if noise is not None:
             noise = noise.detach().to(received.device)
-        elif noise_power is not None:
-            noise = make_complex_gaussian_noise(received, noise_power)
+        elif self.noise_power is not None:
+            # sigma^2 fixed at construction (see make_channel_gain) -- not measured
+            noise = make_complex_gaussian_noise(
+                received, torch.as_tensor(self.noise_power, device=received.device))
         else:
+            # sigma^2 from the measured power of THIS superimposed signal
+            reference_power = signal_power(received, keepdim=True).detach()
             noise = make_awgn_noise(received, self.snr_db, reference_power=reference_power)
 
         if self.keep_last_noise:
@@ -368,12 +309,9 @@ class AWGNMultiUplinkChannel(MultiUplinkChannel):
     def get_last_noise(self) -> Optional[torch.Tensor]:
         return self.last_noise
 
-    def get_last_user_gain(self) -> Optional[torch.Tensor]:
-        """
-        The per-user gain |h_t| applied by the last interfere() call (CPU), shape
-        (*d1, n_tx, *d2, 1). None in the homogeneous case, where h_t == 1.
-        """
-        return self.last_user_gain
+    def get_last_effective_gain(self) -> Optional[torch.Tensor]:
+        """a_k * h_k applied by the last interfere() call (CPU), (*d1, n_tx, *d2, 1)."""
+        return self.last_effective_gain
 
 
 class NopChannel(Channel):
@@ -505,21 +443,26 @@ if __name__ == '__main__':
     assert abs(measured_snr_db(loud, AWGNSingleChannel(10.0).interfere(loud)) - 10.0) < 0.1
     print('[ok] SNR is invariant to the absolute signal scale')
 
-    # --- 3. uplink: output is the superposition plus noise
+    # --- 3. uplink: output is the superposition plus noise, a=h=1 by default
     n_tx = 2
     xs = power_normalize(torch.randn(n_tx, B, L, dtype=torch.complex64), 1.0)
-    ch = AWGNMultiUplinkChannel(n_tx, snr_db=10.0, snr_reference='per_user')
+    ch = AWGNMultiUplinkChannel(n_tx, snr_db=10.0)
     y = ch.interfere(xs, user_dim_index=0)
     assert y.shape == (B, L), y.shape
-    # noise power should be per-user power / 10 == 0.1
     n = y - xs.sum(dim=0)
+    got = measured_snr_db(xs.sum(0), y)
+    assert abs(got - 10.0) < 0.5, got
     print(f'[ok] uplink shape {tuple(xs.shape)} -> {tuple(y.shape)}, '
-          f'noise power {signal_power(n).mean().item():.4f} (expect 0.1000)')
+          f'measured SNR {got:.2f} dB (requested 10.0)')
 
-    # --- 4. the two snr_reference conventions differ by exactly n_tx
-    n_recv = AWGNMultiUplinkChannel(n_tx, 10.0, 'received').interfere(xs) - xs.sum(0)
-    ratio = (signal_power(n_recv).mean() / signal_power(n).mean()).item()
-    print(f'[ok] received/per_user noise power ratio = {ratio:.3f} (expect ~{n_tx})')
+    # --- 4. power_alloc and channel_gain both scale the effective per-user gain a_k*h_k
+    ch2 = AWGNMultiUplinkChannel(n_tx, snr_db=10.0, power_alloc=[2.0, 0.5],
+                                 channel_gain=[1.0, 2.0], keep_last_noise=True)
+    ch2.interfere(xs, user_dim_index=0)
+    g = ch2.get_last_effective_gain().squeeze()
+    assert torch.allclose(g, torch.sqrt(torch.tensor([2.0, 0.5])) * torch.tensor([1.0, 2.0]),
+                          atol=1e-4)
+    print(f'[ok] effective gain a_k*h_k = {g.tolist()}')
 
     # --- 5. user dim not at 0, and reproducible noise
     xs2 = torch.randn(B, n_tx, L, dtype=torch.complex64)
@@ -547,23 +490,39 @@ if __name__ == '__main__':
     assert torch.allclose(NopChannel()(xs, user_dim_index=0), xs.sum(dim=0))  # __call__ dispatch
     print('[ok] NopChannel')
 
-    # --- 9. heterogeneous per-user SNR: each user must hit its own requested SNR
+    # --- 9. make_channel_gain: fixed noise_power makes this EXACT, not measured
     want = [15.0, 5.0]
-    hc = AWGNMultiUplinkChannel(2, want, keep_last_noise=True)
-    y = hc.interfere(xs, user_dim_index=0)
-    g = hc.get_last_user_gain()                    # (n_tx, B, 1)
-    sigma2 = signal_power(hc.get_last_noise()).mean()
+    hc = AWGNMultiUplinkChannel.make_channel_gain(2, want, keep_last_noise=True)
+    hc.interfere(xs, user_dim_index=0)
+    g = hc.get_last_effective_gain().squeeze()          # (n_tx,)
+    got_db = 10 * torch.log10(g.pow(2) / hc.noise_power)
     for t, w in enumerate(want):
-        q = signal_power(g[t] ** 2 * xs[t]).mean()  # received power of user t
-        got = (10 * torch.log10(q / sigma2)).item()
-        assert abs(got - w) < 0.1, f'user {t}: {w = } {got = }'
-        print(f'[ok] heterogeneous user {t}: requested {w:5.1f} dB -> received {got:6.2f} dB '
-              f'(|h| = {g[t].mean().item():.3f})')
-    # total received power is preserved, and the homogeneous case is the special case
-    assert abs(signal_power((g * xs).sum(0)).mean().item()
-               - signal_power(xs.sum(0)).mean().item()) < 0.05
-    # equal per-user SNRs must reduce to the homogeneous channel: h_t == 1
-    g_homo = AWGNMultiUplinkChannel(2, [10.0, 10.0])
-    g_homo.interfere(xs)
-    assert torch.allclose(g_homo.get_last_user_gain(), torch.ones(1), atol=1e-4)
-    print('[ok] heterogeneous: total power preserved, equal SNRs reduce to h == 1')
+        assert abs(got_db[t].item() - w) < 1e-3, f'user {t}: {w = } {got_db[t] = }'
+        print(f'[ok] heterogeneous user {t}: requested {w:5.1f} dB -> exactly {got_db[t]:.2f} dB')
+    # equal targets and equal power_alloc must give equal channel_gain across users
+    # (h == 1 specifically only if noise_power is also chosen to match, since sigma^2
+    # is now an independent, fixed constant rather than solved for)
+    g_homo = AWGNMultiUplinkChannel.make_channel_gain(2, [10.0, 10.0])
+    assert torch.allclose(g_homo.channel_gain[0], g_homo.channel_gain[1], atol=1e-4)
+    g_unit = AWGNMultiUplinkChannel.make_channel_gain(2, [10.0, 10.0], noise_power=0.1)
+    assert torch.allclose(g_unit.channel_gain, torch.ones(2), atol=1e-4)
+    print('[ok] equal targets give equal h; h == 1 when noise_power matches the target')
+
+    # --- 10. direct sanity: interfere() must actually perturb the signal, on every path
+    ch_s = AWGNSingleChannel(10.0, keep_last_noise=True)
+    y_s = ch_s.interfere(xs[0])
+    assert not torch.allclose(xs[0], y_s), 'AWGNSingleChannel produced no change at all'
+    assert torch.allclose(y_s, xs[0] + ch_s.get_last_noise())
+    print('[ok] AWGNSingleChannel: output = input + noise, and they differ')
+
+    ch_m = AWGNMultiUplinkChannel(n_tx, snr_db=10.0, keep_last_noise=True)
+    y_m = ch_m.interfere(xs, user_dim_index=0)
+    assert not torch.allclose(xs.sum(dim=0), y_m), 'AWGNMultiUplinkChannel (snr_db) added no noise'
+    print('[ok] AWGNMultiUplinkChannel (snr_db path): differs from the noiseless superposition')
+
+    ch_g = AWGNMultiUplinkChannel.make_channel_gain(2, [15.0, 5.0], keep_last_noise=True)
+    y_g = ch_g.interfere(xs, user_dim_index=0)
+    g = ch_g.get_last_effective_gain().to(xs.device)
+    assert not torch.allclose((xs * g).sum(dim=0), y_g), \
+        'AWGNMultiUplinkChannel (noise_power path) added no noise'
+    print('[ok] AWGNMultiUplinkChannel (noise_power path): differs from the noiseless superposition')
