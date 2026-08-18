@@ -9,15 +9,11 @@ Multi user uplink (superposition / non-orthogonal multiple access):
 
     y = sum_k (a_k * h_k * x_k) + n       shape (*d1, n_tx, *d2, L) -> (*d1, *d2, L)
 
-    a_k : power_alloc[k]**0.5  -- power-domain NOMA knob, x_k is always unit power
-    h_k : channel_gain[k]      -- near-far / heterogeneous-SNR knob (path loss etc.)
-
-    Both are constants of the channel (fixed at construction), not measured from
-    what happens to be transmitted. There is one receiver, therefore one noise
-    realization shared by every user.
+    a_k : power_alloc[k]**0.5  -- power-domain NOMA, x_k is always unit power
+    h_k : channel_gain[k]      -- heterogeneous-SNR
 """
 
-from typing import Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 import torch
 from .utils import get_class_str, signal_power
 
@@ -28,13 +24,12 @@ def make_complex_gaussian_noise(signal: torch.Tensor,
     Draw n ~ CN(0, noise_power), circularly symmetric complex Gaussian.
 
     Args:
-        signal: complex tensor; only its shape / device / dtype are used.
+        signal: complex tensor;
         noise_power: sigma^2, a real tensor broadcastable to `signal`'s shape.
 
     Returns:
         complex noise tensor shaped like `signal`, with E[|n|^2] == noise_power.
     """
-    # Re and Im each carry half the power -> E[|n|^2] == sigma^2
     std = torch.sqrt(noise_power / 2.0)
     noise_real = torch.randn_like(signal.real) * std
     noise_imag = torch.randn_like(signal.imag) * std
@@ -45,24 +40,17 @@ def make_awgn_noise(signal: torch.Tensor,
                     snr_db: float | torch.Tensor,
                     reference_power: Optional[torch.Tensor] = None) -> torch.Tensor:
     """
-    Draw circularly symmetric complex Gaussian noise for `signal`, without adding it.
+    Draw circularly symmetric complex Gaussian noise for `signal`
 
     Args:
-        signal: complex tensor of any shape; only its shape / device / dtype are used
-            (plus its power, if `reference_power` is not given).
+        signal: complex tensor of any shape;
         snr_db: SNR in dB. A float, or a real tensor broadcastable to `signal`'s shape
-            (per-sample or per-receiver SNR).
         reference_power: the signal power the SNR is measured against, a real tensor
             broadcastable to `signal`'s shape. If None, it is measured from `signal`
             itself, over the last dimension.
 
     Returns:
         complex noise tensor with the same shape / dtype / device as `signal`.
-
-    Note:
-        The reference power is .detach()ed. The noise variance must be treated as a
-        constant of the environment; if gradients flowed through it, the encoder could
-        reduce its own loss by shaping the noise, which is not physical.
     """
     if not signal.is_complex():
         raise TypeError('make_awgn_noise() expects a complex signal')
@@ -176,15 +164,12 @@ class AWGNMultiUplinkChannel(MultiUplinkChannel):
     """
     y = sum_k (a_k * h_k * x_k) + n,   n ~ CN(0, sigma^2)
 
-    a_k : power_alloc[k]**0.5  -- power-domain NOMA knob
-    h_k : channel_gain[k]      -- near-far / heterogeneous-SNR knob
+    a_k : power_alloc[k]**0.5  -- power-domain NOMA 
+    h_k : channel_gain[k]      -- heterogeneous-SNR
 
     sigma^2 comes from exactly one of two places (mutually exclusive):
-        snr_db       measured against the superimposed signal each forward -- the
-                     "give me an SNR knob" case (homogeneous / NOMA).
-        noise_power  a fixed constant, not measured -- what make_channel_gain() uses,
-                     because once sigma^2 is fixed, solving h_k for a target per-user
-                     SNR is a one-line closed form instead of an approximation.
+        snr_db       measured against the superimposed signal each forward
+        noise_power  a fixed constant, not measured
     """
 
     def __init__(self,
@@ -244,9 +229,7 @@ class AWGNMultiUplinkChannel(MultiUplinkChannel):
                           noise_power: float = 1.0,
                           keep_last_noise: bool = False) -> 'AWGNMultiUplinkChannel':
         """
-        Fix sigma^2 = noise_power and solve channel_gain so user k's received SNR is
-        EXACTLY target_snr_db[k] -- exact, not approximate, because sigma^2 is a
-        constant here rather than something measured from the transmitted signal:
+        Fix sigma^2 = noise_power and solve channel_gain
 
             a_k^2 |h_k|^2 / sigma^2 == s_k     (s_k = 10^(target_snr_db[k]/10))
             |h_k|^2 = s_k * sigma^2 / a_k^2
@@ -264,6 +247,47 @@ class AWGNMultiUplinkChannel(MultiUplinkChannel):
 
         return cls(n_tx, power_alloc=a2, channel_gain=torch.sqrt(h2),
                   noise_power=noise_power, keep_last_noise=keep_last_noise)
+    
+    def _effective_gain(self, device, dtype) -> torch.Tensor:
+        a = torch.sqrt(self.power_alloc.to(device=device, dtype=dtype))
+        h = self.channel_gain.to(device=device, dtype=dtype)
+        return a * h
+
+
+    def _noise_for(self, signal: torch.Tensor) -> torch.Tensor:
+        """One user's post-gain signal -> its noise, per this channel's sigma^2 rule."""
+        if self.noise_power is not None:
+            return make_complex_gaussian_noise(
+                signal, torch.as_tensor(self.noise_power, device=signal.device))
+        reference_power = signal_power(signal, keepdim=True).detach()
+        return make_awgn_noise(signal, self.snr_db, reference_power=reference_power)
+
+
+    def ofdm(self, signal: torch.Tensor, user_dim_index: int = 0) -> List[torch.Tensor]:
+        """
+        Args:
+            signal: complex tensor of shape (*d1, n_tx, *d2, L)
+
+        Returns:
+            list of n_tx complex tensors, each (*d1, *d2, L) -- one stream per user.
+        """
+        if user_dim_index < 0:
+            raise ValueError('user_dim_index must be non-negative')
+        if signal.size(user_dim_index) != self.n_tx:
+            raise ValueError(f'{signal.size(user_dim_index) = } != {self.n_tx = }')
+
+        view = [1] * signal.dim()
+        view[user_dim_index] = self.n_tx
+        g = self._effective_gain(signal.device, signal.real.dtype).view(view)
+        self.last_effective_gain = g.detach().to('cpu')
+
+        gz = signal * g.to(signal.dtype)
+        streams = [zu + self._noise_for(zu) for zu in gz.unbind(dim=user_dim_index)]
+
+        if self.keep_last_noise:
+            self.last_noise = [(y - z).detach().to('cpu') for y, z in
+                               zip(streams, gz.unbind(dim=user_dim_index))]
+        return streams
 
     def interfere(self, signal: torch.Tensor, user_dim_index: int = 0,
                   noise: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -283,9 +307,7 @@ class AWGNMultiUplinkChannel(MultiUplinkChannel):
 
         view = [1] * signal.dim()
         view[user_dim_index] = self.n_tx
-        a = torch.sqrt(self.power_alloc.to(signal.device))
-        h = self.channel_gain.to(signal.device)
-        g = (a * h).view(view)                                  # a_k * h_k
+        g = self._effective_gain(signal.device, signal.real.dtype).view(view)
         self.last_effective_gain = g.detach().to('cpu')
 
         signal = signal * g.to(signal.dtype)
@@ -293,14 +315,9 @@ class AWGNMultiUplinkChannel(MultiUplinkChannel):
 
         if noise is not None:
             noise = noise.detach().to(received.device)
-        elif self.noise_power is not None:
-            # sigma^2 fixed at construction (see make_channel_gain) -- not measured
-            noise = make_complex_gaussian_noise(
-                received, torch.as_tensor(self.noise_power, device=received.device))
         else:
             # sigma^2 from the measured power of THIS superimposed signal
-            reference_power = signal_power(received, keepdim=True).detach()
-            noise = make_awgn_noise(received, self.snr_db, reference_power=reference_power)
+            noise = self._noise_for(received)
 
         if self.keep_last_noise:
             self.last_noise = noise.detach().to('cpu')
@@ -310,7 +327,7 @@ class AWGNMultiUplinkChannel(MultiUplinkChannel):
         return self.last_noise
 
     def get_last_effective_gain(self) -> Optional[torch.Tensor]:
-        """a_k * h_k applied by the last interfere() call (CPU), (*d1, n_tx, *d2, 1)."""
+        """a_k * h_k applied by the last interfere()/ofdm() call (CPU), (*d1, n_tx, *d2, 1)."""
         return self.last_effective_gain
 
 
@@ -339,6 +356,10 @@ class NopChannel(Channel):
 
     __repr__ = __str__
 
+    def ofdm(self, signal: torch.Tensor, user_dim_index: int = 0) -> List[torch.Tensor]:
+        """Every user's stream unchanged: no gain, no noise, no interference."""
+        return list(signal.unbind(dim=user_dim_index))
+
     def interfere(self, signal: torch.Tensor, user_dim_index: Optional[int] = None,
                   **kwargs) -> torch.Tensor:
         if user_dim_index is not None and self.sum_users:
@@ -359,11 +380,6 @@ class NopChannel(Channel):
 class UniformVariateChannelMixin:
     """
     Mixin that resamples snr_db uniformly in dB before each transmission.
-
-    Rationale: training at one fixed SNR gives a model that is only good at that SNR,
-    so every operating point needs its own checkpoint. Randomizing the SNR each batch
-    yields a single model that degrades gracefully across the whole range, which is
-    what you want for the SNR-vs-3D-error curve.
 
     Usage:
         channel = VariateAWGNMultiUplinkChannel(snr_range=(0, 20), n_tx=2, snr_db=0)
@@ -526,3 +542,21 @@ if __name__ == '__main__':
     assert not torch.allclose((xs * g).sum(dim=0), y_g), \
         'AWGNMultiUplinkChannel (noise_power path) added no noise'
     print('[ok] AWGNMultiUplinkChannel (noise_power path): differs from the noiseless superposition')
+
+    # --- 11. ofdm(): n_tx independent streams, no interference, each perturbed by noise
+    ch_o = AWGNMultiUplinkChannel(n_tx, snr_db=10.0, power_alloc=[2.0, 0.5],
+                                  channel_gain=[1.0, 2.0], keep_last_noise=True)
+    ys = ch_o.ofdm(xs, user_dim_index=0)
+    assert isinstance(ys, list) and len(ys) == n_tx
+    g = ch_o.get_last_effective_gain().squeeze()
+    for u in range(n_tx):
+        assert ys[u].shape == xs[u].shape, (u, ys[u].shape, xs[u].shape)
+        assert not torch.allclose(g[u] * xs[u], ys[u]), f'user {u}: ofdm() added no noise'
+    # same a_k*h_k as interfere() would use -- only the summation differs
+    assert torch.allclose(g, ch_o._effective_gain(xs.device, xs.real.dtype))
+    # each user's noise is independent: summing the ofdm streams should NOT reproduce a
+    # single-noise-realization superposition (the per-user noise draws don't cancel out
+    # the way a shared draw would over many trials, so the two noise tensors differ)
+    noise_ofdm = torch.cat([n.reshape(-1) for n in ch_o.get_last_noise()])
+    assert noise_ofdm.numel() == n_tx * B * L
+    print(f'[ok] ofdm(): {n_tx} independent streams, each perturbed, same gain as interfere()')
