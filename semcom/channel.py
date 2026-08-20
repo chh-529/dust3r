@@ -224,30 +224,31 @@ class AWGNMultiUplinkChannel(MultiUplinkChannel):
     __repr__ = __str__
 
     @classmethod
-    def make_channel_gain(cls, n_tx: int, target_snr_db: Sequence[float],
+    def make_channel_gain(cls, n_tx: int, target_snr_db: float, split_db: float = 0.0,
                           power_alloc: Optional[Sequence[float]] = None,
                           noise_power: float = 1.0,
                           keep_last_noise: bool = False) -> 'AWGNMultiUplinkChannel':
         """
-        Fix sigma^2 = noise_power and solve channel_gain
+        Fix the RECEIVED SNR of the combined signal
 
-            a_k^2 |h_k|^2 / sigma^2 == s_k     (s_k = 10^(target_snr_db[k]/10))
-            |h_k|^2 = s_k * sigma^2 / a_k^2
-
-        power_alloc defaults to a_k == 1 (no NOMA, pure near-far). Equal targets
-        reduce to h_k == 1, the homogeneous channel.
+            q_total = noise_power * 10^(target_snr_db / 10)   -- the fixed power budget
+            r       = 10^(split_db / 10)                       -- user0/user1 power ratio
+            q_0     = q_total * r / (1 + r)
+            q_1     = q_total - q_0
         """
-        target = torch.as_tensor(target_snr_db, dtype=torch.float32)
-        if target.numel() != n_tx:
-            raise ValueError(f'{target.numel() = } != {n_tx = }')
-        a2 = cls._as_vector(power_alloc, n_tx, default=1.0)
+        if n_tx != 2:
+            raise ValueError(f'make_channel_gain is for n_tx == 2 only, got {n_tx = }')
+        a2 = cls._as_vector(power_alloc, 2, default=1.0)
 
-        s = torch.pow(10.0, target / 10.0)
-        h2 = s * noise_power / a2.clamp_min(1e-12)
+        q_total = noise_power * 10.0 ** (float(target_snr_db) / 10.0)
+        r = 10.0 ** (float(split_db) / 10.0)
+        q0 = q_total * r / (1.0 + r)
+        q1 = q_total - q0
+        h2 = torch.tensor([q0, q1], dtype=torch.float32) / a2.clamp_min(1e-12)
 
-        return cls(n_tx, power_alloc=a2, channel_gain=torch.sqrt(h2),
+        return cls(2, power_alloc=a2, channel_gain=torch.sqrt(h2),
                   noise_power=noise_power, keep_last_noise=keep_last_noise)
-    
+
     def _effective_gain(self, device, dtype) -> torch.Tensor:
         a = torch.sqrt(self.power_alloc.to(device=device, dtype=dtype))
         h = self.channel_gain.to(device=device, dtype=dtype)
@@ -506,23 +507,39 @@ if __name__ == '__main__':
     assert torch.allclose(NopChannel()(xs, user_dim_index=0), xs.sum(dim=0))  # __call__ dispatch
     print('[ok] NopChannel')
 
-    # --- 9. make_channel_gain: fixed noise_power makes this EXACT, not measured
-    want = [15.0, 5.0]
-    hc = AWGNMultiUplinkChannel.make_channel_gain(2, want, keep_last_noise=True)
+    # --- 9. make_channel_gain: fixed noise_power makes the TOTAL received SNR EXACT
+    hc = AWGNMultiUplinkChannel.make_channel_gain(2, target_snr_db=10.0, split_db=6.0,
+                                                  keep_last_noise=True)
     hc.interfere(xs, user_dim_index=0)
-    g = hc.get_last_effective_gain().squeeze()          # (n_tx,)
-    got_db = 10 * torch.log10(g.pow(2) / hc.noise_power)
-    for t, w in enumerate(want):
-        assert abs(got_db[t].item() - w) < 1e-3, f'user {t}: {w = } {got_db[t] = }'
-        print(f'[ok] heterogeneous user {t}: requested {w:5.1f} dB -> exactly {got_db[t]:.2f} dB')
-    # equal targets and equal power_alloc must give equal channel_gain across users
-    # (h == 1 specifically only if noise_power is also chosen to match, since sigma^2
-    # is now an independent, fixed constant rather than solved for)
-    g_homo = AWGNMultiUplinkChannel.make_channel_gain(2, [10.0, 10.0])
-    assert torch.allclose(g_homo.channel_gain[0], g_homo.channel_gain[1], atol=1e-4)
-    g_unit = AWGNMultiUplinkChannel.make_channel_gain(2, [10.0, 10.0], noise_power=0.1)
-    assert torch.allclose(g_unit.channel_gain, torch.ones(2), atol=1e-4)
-    print('[ok] equal targets give equal h; h == 1 when noise_power matches the target')
+    g = hc.get_last_effective_gain().squeeze()          # (n_tx,) == a_k * h_k
+    q = g.pow(2)                                          # received power per user
+    total_db = float(10 * torch.log10(q.sum() / hc.noise_power))
+    assert abs(total_db - 10.0) < 1e-3, f'{total_db = }'
+    print(f'[ok] combined received SNR: requested 10.0 dB -> exactly {total_db:.4f} dB')
+
+    split_ratio_db = float(10 * torch.log10(q[0] / q[1]))
+    assert abs(split_ratio_db - 6.0) < 1e-3, f'{split_ratio_db = }'
+    print(f'[ok] split_db=6.0 -> q0/q1 exactly {split_ratio_db:.4f} dB')
+
+    # split_db=0 must split the budget evenly -> equal channel_gain (equal power_alloc)
+    g_even = AWGNMultiUplinkChannel.make_channel_gain(2, target_snr_db=10.0, split_db=0.0)
+    assert torch.allclose(g_even.channel_gain[0], g_even.channel_gain[1], atol=1e-4)
+    print('[ok] split_db=0 gives equal channel_gain across users')
+
+    # each user's ACTUAL post-interference SINR must be BELOW the naive q_k/noise "SNR"
+    # -- that gap IS the interference this function does not (and by design cannot)
+    # target directly, unlike the old per-user-SINR solver this replaced
+    sinr0 = float(10 * torch.log10(q[0] / (hc.noise_power + q[1])))
+    naive0 = float(10 * torch.log10(q[0] / hc.noise_power))
+    assert sinr0 < naive0 - 0.01, f'{sinr0 = } should be well below {naive0 = }'
+    print(f'[ok] user 0 actual SINR {sinr0:.2f} dB < naive (interference-blind) '
+         f'SNR {naive0:.2f} dB, by the amount user 1 interferes')
+
+    # no infeasibility ceiling: even a very lopsided split at a high budget is fine --
+    # unlike targeting two users' SINR independently, nothing here can be "impossible"
+    AWGNMultiUplinkChannel.make_channel_gain(2, target_snr_db=30.0, split_db=40.0)
+    print('[ok] make_channel_gain has no infeasibility ceiling (unlike the old '
+         'independent-SINR-targets design it replaced)')
 
     # --- 10. direct sanity: interfere() must actually perturb the signal, on every path
     ch_s = AWGNSingleChannel(10.0, keep_last_noise=True)
@@ -536,7 +553,8 @@ if __name__ == '__main__':
     assert not torch.allclose(xs.sum(dim=0), y_m), 'AWGNMultiUplinkChannel (snr_db) added no noise'
     print('[ok] AWGNMultiUplinkChannel (snr_db path): differs from the noiseless superposition')
 
-    ch_g = AWGNMultiUplinkChannel.make_channel_gain(2, [15.0, 5.0], keep_last_noise=True)
+    ch_g = AWGNMultiUplinkChannel.make_channel_gain(2, target_snr_db=15.0, split_db=10.0,
+                                                    keep_last_noise=True)
     y_g = ch_g.interfere(xs, user_dim_index=0)
     g = ch_g.get_last_effective_gain().to(xs.device)
     assert not torch.allclose((xs * g).sum(dim=0), y_g), \
