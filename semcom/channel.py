@@ -25,7 +25,7 @@ def make_complex_gaussian_noise(signal: torch.Tensor,
 
     Args:
         signal: complex tensor;
-        noise_power: sigma^2, a real tensor broadcastable to `signal`'s shape.
+        noise_power: sigma^2; a real tensor
 
     Returns:
         complex noise tensor shaped like `signal`, with E[|n|^2] == noise_power.
@@ -40,14 +40,11 @@ def make_awgn_noise(signal: torch.Tensor,
                     snr_db: float | torch.Tensor,
                     reference_power: Optional[torch.Tensor] = None) -> torch.Tensor:
     """
-    Draw circularly symmetric complex Gaussian noise for `signal`
-
     Args:
         signal: complex tensor of any shape;
-        snr_db: SNR in dB. A float, or a real tensor broadcastable to `signal`'s shape
+        snr_db: SNR in dB. A float, or a real tensor
         reference_power: the signal power the SNR is measured against, a real tensor
-            broadcastable to `signal`'s shape. If None, it is measured from `signal`
-            itself, over the last dimension.
+            If None, it is measured from `signal` itself, over the last dimension.
 
     Returns:
         complex noise tensor with the same shape / dtype / device as `signal`.
@@ -169,7 +166,7 @@ class AWGNMultiUplinkChannel(MultiUplinkChannel):
 
     sigma^2 comes from exactly one of two places (mutually exclusive):
         snr_db       measured against the superimposed signal each forward
-        noise_power  a fixed constant, not measured
+        noise_power  a fixed constant
     """
 
     def __init__(self,

@@ -1,13 +1,14 @@
 """
 The end-to-end system: DUSt3R + semantic codec + channel.
 
-    user 1 --[ViT]--> f_1 --[enc_1]--> z_1 --\
+    user 1 --[ViT]--> f_1 --[enc_1]--> z_1 -\
+                                             \
     user 2 --[ViT]--> f_2 --[enc_2]--> z_2 ---+--> y  (ONE receiver)
       ...                                    /
     user N --[ViT]--> f_N --[enc_N]--> z_N -/
 
     receiver: y --[dec_u]--→ f_u_hat (for every user)
-            → form pairs → DUSt3R decoder & heads → pointmaps
+              → form pairs → DUSt3R decoder & heads → pointmaps
 
 Every user carries exactly ONE image; N is unconstrained (>= 2) 
 Two ways the N signals reach the receiver, chosen by `multiplex`:
@@ -28,8 +29,7 @@ from .utils import power_normalize
 
 
 # Diagnostics from the most recent forward, per process. Written by
-# SemComDust3R._record_stats(), read by the training criterion for logging. Never used
-# in the model's own computation.
+# SemComDust3R._record_stats(), read by the training criterion for logging.
 LATEST_STATS: Dict[str, float] = {}
 
 
@@ -41,14 +41,13 @@ class UserSideInfo:
     pos: torch.Tensor                   # (B, S, 2) patch positions, from the encoder
     true_shape: torch.Tensor            # (B, 2) per-sample (height, width)
     img_hw: Tuple[int, int]             # (H, W) of the padded image tensor, in pixels
-    n_tokens: int                       # S, patch tokens
+    n_tokens: int                       # S, num of patch tokens
 
 
 def complete_pairs(n: int, symmetrize: bool = True) -> List[Tuple[int, int]]:
     """
     Receiver-side pairing: the complete graph on N users, as dust3r's make_pairs would
-    build it from N images. Symmetrized, because the global aligner expects both
-    directions of every edge.
+    build it from N images.
     """
     pairs = [(i, j) for i in range(n) for j in range(i)]
     if symmetrize:
@@ -73,15 +72,13 @@ class SemComDust3R(nn.Module):
             encoders: one FeatureChannelEncoder per user
             decoders: one FeatureChannelDecoder per user, same length as `encoders`.
             channel: a MultiUplinkChannel (or NopChannel). Every encoder transmits at
-                unit power; NOMA power allocation and near-far channel gain are the
-                channel's `power_alloc` / `channel_gain`, not a model-level knob -- see
-                semcom.channel.
-            freeze: 'none' (default) trains everything; 'dust3r' freezes the entire
-                    DUSt3R backbone (only trains the codec).
-            receiver: 'direct' hands every decoder the same y; 'sic' does successive
-                    interference cancellation
-            multiplex: 'ofdm' (default) puts every user on their own orthogonal resource.
-                       'superimpose' superimposes every user on one resource.
+                unit power;
+            freeze: 'none': e2e training;
+                    'dust3r': freezes the entire DUSt3R backbone (only trains the codec).
+            receiver: 'direct': hands every decoder the same superimposed y;
+                      'sic': successive interference cancellation
+            multiplex: 'ofdm' (default) : puts every user on their own orthogonal resource.
+                       'superimpose'    : superimposes every user on one resource.
         """
         super().__init__()
 
@@ -284,10 +281,29 @@ class SemComDust3R(nn.Module):
         """
         Same contract as AsymmetricCroCo3DStereo.forward. Requires n_user == 2; use
         forward_scene() for more users.
+
+        n_user == 1 is a separate, EXPERIMENTAL code path (see module docstring's single-
+        transmission variant): only view1's image is ever encoded/transmitted -- view2 is
+        expected to be a content-duplicate of view1 (same scene/camera_pose/pts3d, e.g.
+        from a dataset like semcom.single_view.BlendedMVSSingleView), used only as the
+        second copy of ground truth for the loss, exactly mirroring DUSt3R's own
+        single-image demo trick (pair an image with itself) but with ONE codec/channel
+        transmission instead of two. feats_hat[0] -- the SAME noisy reconstruction -- is
+        fed to BOTH decoder branches, unlike forward_scene()'s n_user=1 branch which is
+        @torch.no_grad() and inference-only; this one keeps the graph for training.
         """
+        if self.n_user == 1:
+            feats, sides = self._encode_images([view1])
+            signals = self._channel_encoder(feats)
+            y = self._transmit(signals)
+            feats_hat = self._channel_decoder(y, sides)
+            self._record_stats(feats, feats_hat, signals, y)
+            return self._decode_pair(feats_hat[0], feats_hat[0], sides[0], sides[0])
+
         if self.n_user != 2:
-            raise RuntimeError(f'forward(view1, view2) needs n_user == 2, got '
-                               f'{self.n_user}; use forward_scene() for more users')
+            raise RuntimeError(f'forward(view1, view2) needs n_user == 2 (or 1, see '
+                               f'docstring), got {self.n_user}; use forward_scene() for '
+                               f'more users')
 
         # --- transmitter
         feats, sides = self._encode_images([view1, view2])
@@ -412,11 +428,8 @@ def build_semcom_dust3r(dust3r: nn.Module,
         share_codec: reuse one encoder/decoder pair for every user. Fine for a first run;
             with multiple users it makes the map (f_1..f_N) -> sum z_u symmetric under
             permuting users, so no decoder can tell them apart (see module docstring).
-        codec_state_dict: a checkpoint's ['model'] dict to load the codec from. Only its
-            'encoders.0.*' / 'decoders.0.*' entries are used (training produces one
-            codec, not N); loaded into every user's encoder/decoder module. With
-            share_codec=True those are all the same object, so this is a single load --
-            see load_codec_state_dict() for the general, missing-key-aware version.
+        codec_state_dict: a checkpoint's ['model'] dict, loaded as every user's starting
+            codec
     """
     from .codec import make_codec_pair
 
@@ -432,33 +445,58 @@ def build_semcom_dust3r(dust3r: nn.Module,
         decoders = [p[1] for p in pairs]
 
     if codec_state_dict is not None:
-        enc_sd = {k[len('encoders.0.'):]: v for k, v in codec_state_dict.items()
-                  if k.startswith('encoders.0.')}
-        dec_sd = {k[len('decoders.0.'):]: v for k, v in codec_state_dict.items()
-                  if k.startswith('decoders.0.')}
-        if not enc_sd or not dec_sd:
-            raise RuntimeError('no encoders.0.* / decoders.0.* weights in the checkpoint')
-        for e in ({id(e): e for e in encoders}).values():
-            e.load_state_dict(enc_sd)
-        for d in ({id(d): d for d in decoders}).values():
-            d.load_state_dict(dec_sd)
+        load_codec_weights(encoders, decoders, codec_state_dict)
 
     return SemComDust3R(dust3r, encoders, decoders, channel,
                         freeze=freeze, receiver=receiver, multiplex=multiplex)
+
+
+def load_codec_weights(encoders: Sequence[FeatureChannelEncoder],
+                       decoders: Sequence[FeatureChannelDecoder],
+                       codec_state_dict: dict) -> None:
+    """
+    Load codec weights from a checkpoint's ['model'] dict into `encoders` / `decoders`,
+    in place, PER USER where the checkpoint has per-user weights.
+
+    Two kinds of checkpoint have to work here, and telling them apart matters:
+
+      one codec   (a --share_codec 1 run) holds only 'encoders.0.*' / 'decoders.0.*'.
+                  Those are BROADCAST to every user, so each starts as an identical copy
+                  and is free to diverge from there under a --share_codec 0 fine-tune.
+      N codecs    (a --share_codec 0 run) holds 'encoders.u.*' for every u. Each user
+                  gets ITS OWN weights.
+
+    Broadcasting slot 0 in the second case silently throws the specialization away and
+    leaves every user identical -- which under 'superimpose' makes the model degenerate
+    (all decoders become the same function of the same y) while under 'ofdm' it stays
+    invisible, because there the decoders get different inputs and their outputs differ
+    anyway. That failure mode is exactly why the per-user branch exists.
+    """
+    def slot(prefix: str, u: int) -> dict:
+        pre = f'{prefix}.{u}.'
+        return {k[len(pre):]: v for k, v in codec_state_dict.items() if k.startswith(pre)}
+
+    if not slot('encoders', 0) or not slot('decoders', 0):
+        raise RuntimeError('no encoders.0.* / decoders.0.* weights in the checkpoint')
+
+    for prefix, modules in (('encoders', encoders), ('decoders', decoders)):
+        seen: dict = {}
+        for u, m in enumerate(modules):
+            if id(m) in seen:       # shared object: loading it again is a no-op
+                continue
+            sd = slot(prefix, u) or slot(prefix, 0)
+            m.load_state_dict(sd)
+            seen[id(m)] = u
 
 
 def load_codec_state_dict(model: SemComDust3R, sd: dict, strict_dust3r: bool = False):
     """
     model.load_state_dict() wrapper that understands share_codec's aliasing.
 
-    With share_codec=True, self.encoders[0] and self.encoders[1] (...N-1) are the SAME
-    nn.Module object, so state_dict() emits BOTH 'encoders.0.*' and 'encoders.1.*' (etc),
-    pointing at identical tensors. A checkpoint saved from an OLDER, smaller-n_user model
-    (e.g. this file's earlier one-transmitter-both-views mode) only has 'encoders.0.*' /
-    'decoders.0.*' -- loading it here still works, because writing 'encoders.0.*' updates
-    the shared tensor that 'encoders.1.*' also points to, but load_state_dict(strict=
-    False) reports 'encoders.1.*' (etc) as "missing" even though it was never actually
-    left stale. This filters exactly that case out before raising.
+    With share_codec=True, encoders[0] and encoders[1] are the same object, so loading
+    a checkpoint that only has 'encoders.0.*' still updates both -- but strict=False
+    would still flag 'encoders.1.*' as "missing". This filters out exactly that false
+    positive before raising.
     """
     missing, unexpected = model.load_state_dict(sd, strict=False)
 
@@ -559,12 +597,45 @@ if __name__ == '__main__':
     model3(v1, v2)
     print(f'[ok] NOMA power allocation: {model3.last_stats}')
 
-    # near-far (per-user target SNR) is separately a channel constructor
-    model3b = build_semcom_dust3r(net, AWGNMultiUplinkChannel.make_channel_gain(2, [15.0, 5.0]),
-                                  n_user=2, share_codec=False,
-                                  multiplex='superimpose').to(device)
-    model3b(v1, v2)
-    print(f'[ok] near-far (per-user target SNR): {model3b.last_stats}')
+    # ---- 3a2. a --share_codec 0 checkpoint must load PER USER. Broadcasting slot 0
+    #           would leave the users identical, which 'superimpose' turns into a fully
+    #           degenerate model (same function, same y) -- and 'ofdm' would hide it.
+    two = build_semcom_dust3r(net, AWGNMultiUplinkChannel(2, snr_db=10.0), n_user=2,
+                              cpr=1 / 6, share_codec=False,
+                              multiplex='superimpose').to(device)
+    for enc in two.encoders:
+        torch.nn.init.normal_(enc.channel_encoder.model[0].weight, std=0.02)
+    per_user_sd = {k: v.detach().clone() for k, v in two.state_dict().items()
+                   if k.startswith(('encoders.', 'decoders.'))}
+    w0 = per_user_sd['encoders.0.channel_encoder.model.0.weight'].cpu()
+    w1 = per_user_sd['encoders.1.channel_encoder.model.0.weight'].cpu()
+    assert not torch.allclose(w0, w1), 'fixture: the two codecs must start different'
+
+    reloaded = build_semcom_dust3r(net, AWGNMultiUplinkChannel(2, snr_db=10.0), n_user=2,
+                                   cpr=1 / 6, share_codec=False,
+                                   codec_state_dict=per_user_sd,
+                                   multiplex='superimpose').to(device)
+    g0 = reloaded.encoders[0].channel_encoder.model[0].weight.detach().cpu()
+    g1 = reloaded.encoders[1].channel_encoder.model[0].weight.detach().cpu()
+    assert torch.allclose(g0, w0) and torch.allclose(g1, w1), \
+        'load_codec_weights broadcast slot 0 instead of each user its own weights'
+    reloaded(v1, v2)
+    assert reloaded.last_stats['user_spread'] > 0, \
+        'independent codecs under superimpose must separate the users (spread > 0)'
+    print(f"[ok] per-user codec load; superimpose spread="
+          f"{reloaded.last_stats['user_spread']:.4f}")
+
+    # a ONE-codec checkpoint must still broadcast to every user
+    one_sd = {k: v for k, v in per_user_sd.items()
+              if k.startswith(('encoders.0.', 'decoders.0.'))}
+    bcast = build_semcom_dust3r(net, AWGNMultiUplinkChannel(2, snr_db=10.0), n_user=2,
+                                cpr=1 / 6, share_codec=False, codec_state_dict=one_sd,
+                                multiplex='superimpose').to(device)
+    b0 = bcast.encoders[0].channel_encoder.model[0].weight.detach().cpu()
+    b1 = bcast.encoders[1].channel_encoder.model[0].weight.detach().cpu()
+    assert torch.allclose(b0, b1) and torch.allclose(b0, w0), \
+        'a single-codec checkpoint must be broadcast to every user'
+    print('[ok] single-codec checkpoint still broadcasts to every user')
 
     # ---- 3b. receiver='sic': strongest user decoded first, ordered by the channel's
     #          own a_u*h_u (not a model-level power_constraints -- that no longer exists)
