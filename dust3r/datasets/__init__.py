@@ -5,6 +5,7 @@ from .base.batched_sampler import BatchedRandomSampler  # noqa
 from .arkitscenes import ARKitScenes  # noqa
 from .blendedmvs import BlendedMVS  # noqa
 from .co3d import Co3d  # noqa
+from .dtu import DTU  # noqa
 from .habitat import Habitat  # noqa
 from .megadepth import MegaDepth  # noqa
 from .scannetpp import ScanNetpp  # noqa
